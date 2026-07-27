@@ -1,4 +1,18 @@
-// sidebar.js
+(function loadAssistant() {
+  if (document.getElementById("gpa-assistant-css")) return;
+  if (document.getElementById("ai-assistant-btn")) return;
+  var v = "?v=7";  // cache-bust: bump whenever assistant.css/js change so visitors get the update, not a stale copy
+  const link = document.createElement("link");
+  link.id = "gpa-assistant-css";
+  link.rel = "stylesheet";
+  link.href = "/css/assistant.css" + v;
+  document.head.appendChild(link);
+  const script = document.createElement("script");
+  script.src = "/js/assistant.js" + v;
+  script.defer = true;
+  document.body.appendChild(script);
+})();
+
 document.addEventListener("DOMContentLoaded", () => {
   // Inject site favicon into <head> so all pages that load the sidebar get it.
   try {
