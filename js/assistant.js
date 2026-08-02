@@ -5,15 +5,22 @@
   var DEFAULT_MODEL = "qwen3:14b";
   var PREFERRED_EMBED = "nomic-embed-text";
   var INDEX_URL = "/assistant_index.json";
-  var MIN_PARAMS_B = 4.0;
+  var MIN_MODEL_PARAMS_B = 4.0;
   var TOP_K = 6;
   var HISTORY_TURNS = 10;
+  // 0 means NO cap: capText returns the text unchanged when cap <= 0, so evidence chunks reach the model whole.
   var EVIDENCE_CHAR_CAP = 0;
+  // Weight on the semantic (cosine) side; BM25 gets 1 - alpha. Both arrays are min-max normalised first.
   var HYBRID_ALPHA = 0.5;
-  var ANSWER_CHAR_CAP = 500;
+  // Caps only the copy kept in history; what the user sees is never truncated.
+  var HISTORY_ANSWER_CHAR_CAP = 500;
+  // Restored by setIndexing, so it lives here rather than inline in the panel markup alone.
+  var INPUT_PLACEHOLDER = "Ask about GEM-pRF…";
+  // chatComplete only -- the stream path never retries. STREAM_IDLE_MS is a per-chunk gap, not a deadline.
   var LLM_TIMEOUT_MS = 180000;
   var LLM_RETRIES = 3;
   var STREAM_IDLE_MS = 90000;
+  // Substring probes against the installed model name; the prefixes are baked into every cached vector.
   var EMBED_PREFIX = {
     "nomic-embed-text": { doc: "search_document: ", query: "search_query: " },
     "mxbai-embed-large": { doc: "", query: "Represent this sentence for searching relevant passages: " },
@@ -21,6 +28,10 @@
     "bge": { doc: "", query: "Represent this sentence for searching relevant passages: " }
   };
 
+  // The one axis a value choice can turn on. Five prompts ask for it; they must offer the SAME three.
+  var GOAL_TRIAD = "accuracy, runtime, or GPU memory";
+
+  // Grounded-answer prompt: streamChat and generateAnswer only. Other branches have their own *_SYSTEM.
   var SYSTEM_PROMPT =
     "You answer GEM-pRF questions using only the provided evidence. " +
     "Do not use outside knowledge — including textbook, training-data, or general " +
@@ -35,47 +46,43 @@
     "evidence does say, and explicitly note that the source does not address the rest. " +
     "Do not paper over the gap with a citation that does not actually support the claim.\n" +
     "  - The user's question may use vague or anaphoric phrasing (\"it\", \"result\", " +
-    "\"how does it work\"). When an EXPANDED QUERY is provided, treat it as the user's " +
-    "intent and use it to interpret which evidence items are relevant.\n" +
+    "\"how does it work\"). Resolve the reference from the CONVERSATION HISTORY block, then " +
+    "answer the resolved question from the evidence.\n" +
     "  - Code is documentation for STRUCTURE. When evidence includes code (function " +
     "bodies, methods, tests), treat the code as authoritative and INFER the structure " +
     "of values, files, and APIs from how the code constructs or consumes them. Example: " +
     "if a serializer writes `json_entry = args2jsonEntry(muX, muY, sigma, r2, ...)`, the " +
-    "JSON contains those fields. State the inference plainly and cite the code chunk. " +
+    "JSON contains those fields. State the inference plainly, grounding it in that `code` item. " +
     "This license applies to code structure only — not to broader rationales, theory, or " +
     "user-facing semantics.\n" +
-    "  - Only respond with 'INSUFFICIENT_EVIDENCE: <one-sentence reason>' when no " +
-    "evidence item contains or supports the requested fact at all.\n\n" +
+    "  - When no evidence item contains or supports the requested fact at all, your ENTIRE reply " +
+    "must be 'INSUFFICIENT_EVIDENCE: <one-sentence reason>', starting with that token. Never write " +
+    "the token INSUFFICIENT_EVIDENCE anywhere else, in any other sentence.\n\n" +
     "Source-type discipline (CRITICAL for refusal correctness):\n" +
-    "  source_id prefixes encode evidence type:\n" +
-    "    • prose docs: `paper.*`, `website.*` — authoritative for behavior, " +
+    "  Every evidence item is tagged with its class — `prose`, `sample`, or `code`. Trust the " +
+    "tag; do not infer type from the source_id.\n" +
+    "    • `prose` — the paper, the website, and project READMEs. Authoritative for behavior, " +
     "recommendations, UI semantics, defaults, and rationale.\n" +
-    "    • XML sample configs: `github.gem.configs.*`, `repo.sample_config`, " +
-    "`demokit.sample_configs.*` — illustrative attribute values from example files. " +
-    "These are sample data, NOT normative defaults or recommendations.\n" +
-    "    • code: `code.*` — authoritative only for code structure and what fields/keys " +
+    "    • `sample` — attribute values read out of example XML config files. Illustrative sample " +
+    "data, NOT normative defaults or recommendations.\n" +
+    "    • `code` — source and tests. Authoritative for code structure and what fields/keys " +
     "exist; not for UI behavior or recommended settings.\n" +
-    "  The rule below applies ONLY to three question classes: (a) UI behavior, (b) " +
-    "recommended/default values, and (c) runtime semantics of a configurator toggle. For " +
-    "these classes ONLY, it OVERRIDES the general 'if ANY evidence contains the fact, " +
-    "answer' rule above. For every OTHER question class — definitions, citations, what " +
-    "fields/keys exist, code structure, numbers stated in prose — the general rule stands " +
-    "and code/XML chunks ARE valid grounding; do not refuse those just because the source " +
-    "is code or XML.\n" +
-    "  For questions about UI behavior (\"what happens when I check/enable/select X\"), " +
-    "recommended or default values (\"what is the default Y\", \"what does GEM-pRF " +
-    "recommend\"), or runtime semantics of a configurator toggle, you MUST cite at least " +
-    "one prose chunk (`paper.*` or `website.*`) that literally states the behavior. An " +
-    "XML attribute value found in a sample config does not establish a default or " +
-    "recommendation. A code if/else branch does not establish UI semantics. If only " +
-    "XML/code chunks are retrieved and no prose chunk states the behavior, refuse with " +
-    "'INSUFFICIENT_EVIDENCE: <reason>' rather than synthesizing the answer from sample " +
-    "values or implementation details.\n\n" +
+    "  For three question classes ONLY — (a) UI behavior (\"what happens when I check/enable/" +
+    "select X\"), (b) recommended or default values (\"what is the default Y\", \"what does " +
+    "GEM-pRF recommend\"), and (c) runtime semantics of a configurator toggle — you MUST ground the " +
+    "answer in a `prose` item that literally states the behavior, and this OVERRIDES the general 'if ANY " +
+    "evidence contains the fact, answer' rule above. A `sample` attribute value does not " +
+    "establish a default or a recommendation; a `code` if/else branch does not establish UI " +
+    "semantics. With no `prose` item stating the behavior, refuse with 'INSUFFICIENT_EVIDENCE: " +
+    "<reason>' rather than synthesizing from sample values or implementation details.\n" +
+    "  For every OTHER question class — definitions, citations, what fields/keys exist, code " +
+    "structure, numbers stated in prose — the general rule stands and `sample`/`code` items ARE " +
+    "valid grounding; do not refuse those because of their class.\n\n" +
     "Endorsement discipline: A documented default or a value stated in the sources is a FACT " +
     "about what the software does, not an endorsement. Report defaults and stated values plainly " +
     "('the default is X', 'the sample config sets X'). Do NOT assert that a value is 'appropriate', " +
     "'correct', 'the right choice', 'safe to use', 'suitable', or 'recommended' for the user's case " +
-    "unless a prose source (`paper.*` or `website.*`) explicitly recommends it, and NEVER manufacture " +
+    "unless a `prose` item explicitly recommends it, and NEVER manufacture " +
     "certainty ('we can be certain', 'this is definitely appropriate') the evidence does not state.\n\n" +
     "Completeness rule: Include every factual detail the question implicitly asks for. " +
     "Quote numbers, dates, version IDs, software/container names, DOIs, journal volumes, " +
@@ -84,14 +91,16 @@
     "article identifier when present. If the question asks 'which Docker container', " +
     "include the exact container name.\n\n" +
     "Style rule: Be concise but exact. Prefer short, factual sentences. Write in plain " +
-    "English. Do NOT include bracketed source-id citations such as [paper.full] or " +
-    "[website.config_generator] in the answer text — provenance is surfaced separately by " +
-    "the caller via the retrieved evidence list. Numerical values, defaults, ranges, and " +
+    "English. Never reproduce an item's bracketed prefix (e.g. `[prose | paper.full ...]`) or a bare " +
+    "source id as a citation in the answer text — provenance is surfaced separately by the caller via " +
+    "the retrieved evidence list. The heading inside that prefix IS evidence: a fact carried only there " +
+    "(a title, a journal, a year, a version) is yours to use — state it in your own sentence rather than " +
+    "quoting the label around it. Numerical values, defaults, ranges, and " +
     "mathematical formulas in plain notation are fine; quoted strings from log messages are " +
     "fine.\n" +
     "  Code is first-class evidence, exactly like the paper and the docs — not something to " +
     "be hidden. When the question asks about the source, implementation, or the exact " +
-    "code/lines/logic, AND a `code.*` evidence item contains it, quote the relevant lines " +
+    "code/lines/logic, AND a `code` evidence item contains it, quote the relevant lines " +
     "verbatim in a fenced code block and then explain in plain English what they do. Quote " +
     "only what a code chunk literally contains; never reconstruct or invent code that is not " +
     "in the evidence.\n" +
@@ -99,13 +108,20 @@
     "explanations), answer in plain English and do NOT sprinkle raw identifiers into the " +
     "prose: refer to configurator fields by their UI labels (e.g. 'Normalize HRF', 'Default " +
     "GPU', 'Refine Fitting') rather than their XML paths (e.g. /root/stimulus/binarization/" +
-    "@enable), module or function names (e.g. gem.init_setup.manage_gpus, np.linspace), or " +
-    "environment variables (e.g. os.environ['CUDA_VISIBLE_DEVICES']). The distinction is " +
-    "purpose, not source type: quote code when the user wants the code, describe it in plain " +
-    "English when the user wants the concept.\n\n" +
+    "@enable), module or function names (e.g. gem.init_setup.manage_gpus, np.linspace), " +
+    "internal variable names (e.g. batch_size, total_y_signals, num_frames_downsampled), or " +
+    "environment variables (e.g. os.environ['CUDA_VISIBLE_DEVICES']). Say what the code does " +
+    "in the user's terms -- 'the run divides the signals by this value to size each batch', " +
+    "not 'batch_size = total_y_signals / num_batches'.\n" +
+    "  Much of the prose evidence is itself written in that internal register, naming XML " +
+    "paths, classes, and variables inline. That is how the source documents it, NOT a licence " +
+    "to answer that way: translate it, and never let a chunk's phrasing carry identifiers into " +
+    "your prose just because they sit in the sentence you are drawing the fact from. The " +
+    "distinction is purpose, not source type: quote code when the user wants the code, " +
+    "describe it in plain English when the user wants the concept.\n\n" +
     "Do not invent numbers, citations, authors, container names, version IDs, " +
     "affiliations, rationales, mechanisms, or explanations that are not present in the " +
-    "evidence.\n\n" +
+    "evidence, and never offer a value as one the field commonly uses.\n\n" +
     "A CONVERSATION HISTORY block may precede the question. Use it ONLY to resolve what " +
     "the question refers to (e.g. 'it', 'that parameter', a short follow-up). Prior " +
     "answers are NOT evidence: every factual claim must still be grounded in the " +
@@ -115,6 +131,12 @@
     "I do not have enough support in the allowed GEM-pRF sources to answer that reliably. " +
     "This prototype is restricted to the paper, GEM-pRF docs, and the published package code.";
 
+  // Refusal contract: anchored at the reply's start like CLARIFY:, surviving a leading quote or **.
+  function isRefusal(text) {
+    return /^["'`*\s]*INSUFFICIENT_EVIDENCE\b/i.test(String(text || ""));
+  }
+
+  // Human-prompt suffix when clarifying is allowed; the model replies with one CLARIFY: line.
   var CLARIFY_DIRECTIVE =
     "\n\nYou may, for THIS answer only, ask ONE clarifying question -- but ONLY in these cases, and only " +
     "when a brief answer from the user would genuinely change what you say:\n" +
@@ -131,21 +153,34 @@
     "given a goal (now or earlier), answer too, reasoning from the documented mechanism toward it and " +
     "saying plainly when the documentation does not establish how the value affects that goal.";
 
+  // Human-prompt suffix, set only on the turn that ANSWERS a value-choice clarify -- never on the first ask.
   var VALUE_ANSWER_DIRECTIVE =
-    "\n\nThe user is choosing a value for a setting and has now given their goal. Using ONLY the evidence, " +
-    "write a short natural-prose answer (no headings, no numbered list). First, explain the governing " +
+    "\n\nThe user is choosing a value for a setting and has now given their goal or constraint. Using ONLY " +
+    "the evidence, write a short natural-prose answer (no headings, no numbered list). The system rules " +
+    "above still bind -- in particular, do not endorse a value and do not invent one.\n" +
+    "Answer the input they actually gave. Name it back to them and say what it does and does not settle -- " +
+    "an answer that never mentions what they just told you has ignored them. First, explain the governing " +
     "logic from the evidence -- what this value controls and what a good choice depends on (another " +
-    "setting, the stimulus, the dataset, or the hardware) -- reasoning toward the goal they gave. Then, if " +
-    "the evidence documents a specific value or default, state it as such; if the evidence documents NO " +
-    "specific value for their case, say so plainly. Do NOT invent, estimate, or recall a value, number, or " +
-    "formula that is not in the evidence -- not even a commonly-used field convention (e.g. do not say a " +
-    "value 'is commonly used'). Do NOT end with a question. Stop after stating what the evidence does and " +
-    "does not provide.";
+    "setting, the stimulus, the dataset, or the hardware) -- reasoning toward what they gave. Where the " +
+    "evidence states a CONSTRAINT their input runs into (something that must fit, a limit that is exceeded, " +
+    "or a different setting that actually governs their case), say so and name that setting: a documented " +
+    "constraint answers them as squarely as a number does.\n" +
+    "Then state every concrete value the evidence carries for this setting, INCLUDING one that appears only " +
+    "in a sample or default configuration: name it and say what it is (a documented default, not a " +
+    "recommendation) rather than calling the evidence silent. Say the evidence documents no value only when " +
+    "it shows none. Where the evidence gives a RULE instead of a number (e.g. 'x times the stimulus'), state " +
+    "the rule AS a rule and never supply operands of your own to illustrate it.\n" +
+    "Land it. When the evidence carries a documented value AND a direction to move it, put the two together " +
+    "for them -- the documented value is where the documentation starts them, the documented direction is " +
+    "how it says to move from there -- attributing both to the documentation. When the evidence cannot " +
+    "convert what they gave into a number, say that plainly in one sentence and then give them what it DOES " +
+    "support, rather than closing on what is missing. Do NOT end with a question.";
 
+  // Used when clarifying is allowed; the flat refusal is used when it is not.
   var INTERACTIVE_NO_EVIDENCE_MESSAGE =
     "I don't have a grounded answer for that in the GEM-pRF paper, docs, or package code. If you're " +
-    "configuring a setting, tell me which one and what you're optimizing for -- accuracy, runtime, or " +
-    "GPU memory -- and I'll answer from the documentation.";
+    "configuring a setting, tell me which one and what you're optimizing for -- " + GOAL_TRIAD +
+    " -- and I'll answer from the documentation.";
 
   var NO_EVIDENCE_TURN_SYSTEM =
     "You are the GEM-pRF configuration assistant. GEM-pRF configures population receptive field (pRF) " +
@@ -153,8 +188,7 @@
     "in front of you. Reply in one or two sentences:\n" +
     "  - If it is conversational or meta (a greeting, thanks, small talk, or asking what you need from " +
     "them), respond naturally and briefly, then steer them toward their configuration: invite them to " +
-    "name the setting they're configuring and what they're optimizing for (accuracy, runtime, or GPU " +
-    "memory).\n" +
+    "name the setting they're configuring and what they're optimizing for (" + GOAL_TRIAD + ").\n" +
     "  - If it is a factual GEM-pRF question you have no documentation for, say plainly that the GEM-pRF " +
     "sources (paper, docs, package code) do not cover it. Do not guess.\n" +
     "Hard rule: you have NO evidence, so state NO GEM-pRF fact, default, parameter value, formula, or " +
@@ -163,7 +197,7 @@
 
   var NEEDS_GOAL_SYSTEM =
     "You triage questions for a GEM-pRF configuration assistant. Some settings have a best value that " +
-    "depends on the user's goal (accuracy, runtime, or GPU memory).\n" +
+    "depends on the user's goal (" + GOAL_TRIAD + ").\n" +
     "Answer YES only if the user is asking which value to CHOOSE or USE for a setting AND the message " +
     "gives NO purpose, goal, or constraint to guide that choice.\n" +
     "Answer NO in every other case, including:\n" +
@@ -175,17 +209,29 @@
 
   var VALUE_CLARIFY_SYSTEM =
     "The user is choosing a value for a GEM-pRF setting but has not given the information needed to " +
-    "recommend one. Using the setting's documented purpose below AND your general understanding of how " +
-    "such a setting is chosen in practice, ask ONE short, natural clarifying question for the CONCRETE, " +
-    "real-world quantity the user actually knows about their own experiment that would determine a good " +
-    "value -- for example the scan/run length (or the TR and number of volumes), the dataset size, the " +
-    "available GPU memory, or the stimulus's size on screen. Prefer that operational input over an " +
-    "abstract internal quantity: e.g. for a low-frequency-drift regressor, ask how long their runs are " +
-    "and what high-pass cutoff they want, NOT 'how much drift do you expect'; for a memory or batch " +
-    "setting, ask their dataset size and GPU memory; for a stimulus setting, ask the stimulus's extent on " +
-    "screen. You may use general knowledge to decide WHICH input to ask for, but you must NOT assert any " +
-    "GEM-pRF fact, default, formula, or value -- only ask the question. If more than one distinct setting " +
-    "matches the user's term, ask which they mean as part of the same question. You may add that they can " +
+    "recommend one. Ask ONE short, natural clarifying question for the input that would let the " +
+    "documentation below actually settle the value.\n" +
+    "Their reply is answered from that documentation ALONE -- no outside formula, convention, or estimate. " +
+    "So before you ask, test your question: if the user answered it, could the documentation below turn " +
+    "that answer into THIS setting's value? Only ask if it can. Which case you are in depends on what the " +
+    "documentation carries:\n" +
+    "- It gives a rule that SETS this setting from a quantity (e.g. 'this value should be x times the " +
+    "stimulus radius'): ask for that quantity in the real-world form the user knows it -- the scan/run " +
+    "length (or the TR and number of volumes), the stimulus's extent on screen. Prefer that operational " +
+    "input over an abstract internal quantity: for a low-frequency-drift regressor, ask how long their runs " +
+    "are and what high-pass cutoff they want, NOT 'how much drift do you expect'.\n" +
+    "- Careful: a formula that computes something ELSE from this setting does not run backwards. If the " +
+    "documentation says a batch size is the signal count divided by this setting, the signal count does not " +
+    "pick the setting -- it only says what a chosen value would work out to. Asking for it buys nothing. " +
+    "The same holds for any quantity the documentation merely mentions near the setting without using it to " +
+    "determine the value.\n" +
+    "- Otherwise the documentation gives only a DIRECTION (larger values cost less peak memory but more " +
+    "iterations) and no way to compute a number: ask which way they want to trade -- " + GOAL_TRIAD +
+    ". A direction can serve a goal, but it cannot turn a hardware figure or a dataset size into " +
+    "a value, so do NOT ask for a number the documentation has no way to spend. A question whose answer " +
+    "cannot change the reply is worse than no question.\n" +
+    "You may use general knowledge to judge WHICH input the documentation needs, but you must NOT assert " +
+    "any GEM-pRF fact, default, formula, or value -- only ask the question. You may add that they can " +
     "say 'just the default' for the documented value.\n" +
     "Do NOT repeat or rephrase the user's own question back to them. Ask about ONLY the setting the user " +
     "asked about; never introduce or offer a DIFFERENT parameter as an alternative. Reply with only the " +
@@ -197,10 +243,17 @@
     "referent in so the question stands on its own. If it is already self-contained, return it " +
     "UNCHANGED -- a question that names its own subject (e.g. 'What is nDCT?', 'What does " +
     "binarization do?') is self-contained even when earlier turns discussed other settings, so do " +
-    "NOT graft that prior context onto it. Resolve references from what the user previously ASKED; do " +
+    "NOT graft that prior context onto it. Whatever the latest question leaves unsaid comes from the " +
+    "MOST RECENT turn -- that turn is the referent, and an earlier one becomes the referent only when " +
+    "the latest question points at it explicitly. Phrasing an earlier turn happens to share with the " +
+    "latest question is NOT a reference: two questions worded alike are still about their own " +
+    "subjects, so a repeated 'what value should I use' asks about the most recent setting, not the " +
+    "one an earlier turn asked it about. Resolve references from what the user previously ASKED; do " +
     "not import a specific parameter or setting name from the assistant's ANSWER unless the latest " +
     "question explicitly refers to it (a new topic in the latest question overrides a prior answer's " +
-    "subject). Do not answer it, do not add new topics -- output only the rewritten question.";
+    "subject). Name the referent the way the USER named it -- the setting's own name, never a code " +
+    "variable, formula term, or field name the assistant's answer used for it (fold in 'Batches', not " +
+    "'batch_size'). Do not answer it, do not add new topics -- output only the rewritten question.";
 
   var STOPWORDS = new Set(("a an the of to in on for and or is are was were be been being do does did " +
     "how what which when where why who whom this that these those it its as at by with from into " +
@@ -208,9 +261,10 @@
     "if then than so such not no yes about over under between out up down off also just only " +
     "gem prf gemprf does use used using get set").split(/\s+/));
 
-  var idx = null;
+  var knowledgeIndex = null;
+  // bm25 and chunkVectors are positionally parallel to knowledgeIndex.chunks -- all three from one corpus.
   var bm25 = null;
-  var models = [];
+  var chatModels = [];
   var embedModels = [];
   var chatModel = DEFAULT_MODEL;
   var embedModel = null;
@@ -218,14 +272,15 @@
   var paramRows = null;
   var connected = false;
   var busy = false;
+  // True while the corpus is being embedded; the input is held shut for the duration.
+  var indexing = false;
   var history = [];
   var activeBot = null;
   var pendingClarify = null;
   var valueChoiceActive = false;
   var els = {};
 
-
-  // Lowercase word tokens, minus stopwords and short fragments.
+  // Lowercase word tokens minus stopwords. '.' and '_' stay INSIDE a token so paper.full survives whole.
   function tokenize(s) {
     var out = [];
     var raw = (s || "").toLowerCase().match(/[a-z0-9_.]+/g) || [];
@@ -263,10 +318,9 @@
     return html;
   }
 
-
-  // Build the BM25 model over the corpus chunks.
   function prepareBm25(chunks) {
     var docs = chunks.map(function (c) {
+      // The de-punctuated source_id rides along so 'paper.full' also matches a question that says 'paper'.
       var sidWords = (c.source_id || "").replace(/[._]/g, " ");
       return tokenize(c.heading + " " + sidWords + " " + c.text);
     });
@@ -289,18 +343,19 @@
     return { tf: tf, df: df, N: N, avgdl: totalLen / (N || 1), len: docs.map(function (d) { return d.length; }) };
   }
 
-  function bm25Score(model, weightedTerms) {
+  // One score per chunk, positionally aligned with knowledgeIndex.chunks. weightedTerms is term -> weight.
+  function scoreChunksBm25(bm25Model, weightedTerms) {
     var k1 = 1.5, b = 0.75;
-    var scores = new Array(model.N).fill(0);
-    for (var d = 0; d < model.N; d++) {
+    var scores = new Array(bm25Model.N).fill(0);
+    for (var d = 0; d < bm25Model.N; d++) {
       var s = 0;
-      var dl = model.len[d];
+      var dl = bm25Model.len[d];
       for (var term in weightedTerms) {
-        var f = model.tf[d][term];
+        var f = bm25Model.tf[d][term];
         if (!f) continue;
-        var n = model.df[term] || 0;
-        var idfv = Math.log(1 + (model.N - n + 0.5) / (n + 0.5));
-        var denom = f + k1 * (1 - b + b * dl / model.avgdl);
+        var n = bm25Model.df[term] || 0;
+        var idfv = Math.log(1 + (bm25Model.N - n + 0.5) / (n + 0.5));
+        var denom = f + k1 * (1 - b + b * dl / bm25Model.avgdl);
         s += weightedTerms[term] * idfv * (f * (k1 + 1)) / denom;
       }
       scores[d] = s;
@@ -308,61 +363,103 @@
     return scores;
   }
 
-  var MIN_PARAMETER_SCORE = 0.32;
-  var PARAMETER_CUTOFF_MARGIN = 0.05;
+  // Absolute cosine floor for the embedding matcher only; the per-model value ships in meta.parameter_floor.
+  var DEFAULT_PARAMETER_FLOOR = 0.58;
+  // Which parameters the ANSWER cites: tight, or unrelated settings ride into the prompt.
+  var PARAMETER_TIE_BAND = 0.02;
   var MAX_RETURNED_PARAMETERS = 4;
+  // What forkCandidates may offer: wider than the band, since two live settings can score ~0.07 apart.
+  var FORK_POOL_SIZE = 6;
 
-  function paramRowTexts() {
+  // Two rows per parameter (naming, meaning) so a question can match either surface; order feeds buildParamVectors.
+  function buildParamRows() {
     var rows = [];
-    (idx.parameters || []).forEach(function (p) {
+    (knowledgeIndex.parameters || []).forEach(function (p) {
       rows.push({ pid: p.id, text: p.label + ". Aliases: " + ((p.aliases || []).join(", ")) + ". Identifier: " + p.id + "." });
       rows.push({ pid: p.id, text: "XML path: " + (p.xml_path || "") + ". Summary: " + (p.summary || "") + " Significance: " + (p.significance || "") });
     });
     return rows;
   }
 
-  // Match parameters by cosine over the catalog rows (two-stage gate).
+  // Match parameters by cosine: absolute floor, then the tie band for specs and a depth cut for the pool.
   function matchParametersEmbedding(qVec) {
-    var best = Object.create(null);
+    // Null-prototype map: the keys are catalog ids, and one named 'constructor' must not inherit a score.
+    var bestScoreByParam = Object.create(null);
+    // paramRows is two rows per parameter, so this walks surfaces (naming, meaning) rather than parameters.
     for (var i = 0; i < paramRows.length; i++) {
+      // Rows and query are both L2-normalized upstream, so this dot product is already the cosine.
       var s = dot(qVec, paramRows[i].vec), pid = paramRows[i].pid;
-      if (best[pid] === undefined || s > best[pid]) best[pid] = s;
+      // Best-of, not sum: hitting either surface hard is the signal; owning two rows is not a bonus.
+      if (bestScoreByParam[pid] === undefined || s > bestScoreByParam[pid]) bestScoreByParam[pid] = s;
     }
-    var ordered = Object.keys(best).map(function (pid) { return [pid, best[pid]]; })
+    var ordered = Object.keys(bestScoreByParam).map(function (pid) { return [pid, bestScoreByParam[pid]]; })
       .sort(function (a, b) { return b[1] - a[1]; });
-    if (!ordered.length) return { specs: [], scores: {} };
-    var cutoff = Math.max(MIN_PARAMETER_SCORE, ordered[0][1] - PARAMETER_CUTOFF_MARGIN);
-    var lookup = Object.create(null);
-    (idx.parameters || []).forEach(function (p) { lookup[p.id] = p; });
-    var specs = [], scores = {};
-    for (var k = 0; k < ordered.length && specs.length < MAX_RETURNED_PARAMETERS; k++) {
-      if (ordered[k][1] < cutoff) break;
-      if (lookup[ordered[k][0]]) { specs.push(lookup[ordered[k][0]]); scores[ordered[k][0]] = ordered[k][1]; }
+    // Empty catalog or unbuilt rows: nothing to gate, and ordered[0] on the next line would throw.
+    if (!ordered.length) return { specs: [], scores: {}, pool: [] };
+    // The floor answers 'names a parameter at all?', the band 'which tie with the best?' -- a max() collapses them.
+    if (ordered[0][1] < parameterFloor()) return { specs: [], scores: {}, pool: [] };
+    var cutoff = ordered[0][1] - PARAMETER_TIE_BAND;
+    var specById = Object.create(null);
+    (knowledgeIndex.parameters || []).forEach(function (p) { specById[p.id] = p; });
+    var specs = [], scores = {}, pool = [];
+    // Pool depth ends the walk: past FORK_POOL_SIZE ranks, nothing can enter either list.
+    for (var k = 0; k < ordered.length && pool.length < FORK_POOL_SIZE; k++) {
+      var spec = specById[ordered[k][0]];
+      // A scored id with no spec means paramRows outlived the catalog -- skip it rather than emit a hole.
+      if (!spec) continue;
+      // Rank alone earns a pool slot: a fork asks the user, so a near-miss is still worth offering.
+      pool.push(spec);
+      // Citing is stricter -- inside the tie band, and capped so one question cannot drag in a whole subsystem.
+      if (ordered[k][1] >= cutoff && specs.length < MAX_RETURNED_PARAMETERS) {
+        specs.push(spec); scores[spec.id] = ordered[k][1];
+      }
     }
-    return { specs: specs, scores: scores };
+    return { specs: specs, scores: scores, pool: pool };
   }
 
-  // Match parameters by label/alias substring (BM25-only fallback).
-  function matchParametersSubstring(question) {
-    var ql = " " + question.toLowerCase() + " ";
-    var matched = [];
-    (idx.parameters || []).forEach(function (p) {
+  // Ordered words, duplicates kept -- unlike disambigTokens, which dedupes and drops anything under 3 chars.
+  function nameWords(text) {
+    return String(text || "").toLowerCase().match(/[a-z0-9_]+/g) || [];
+  }
+
+  // Name matching, the net under the embedder: `named` is a whole name, `partial` a head-anchored run.
+  function matchParametersByName(question) {
+    // Single-space joins on both sides, so every indexOf below is word-boundary anchored by construction.
+    var qwords = nameWords(question), qjoin = " " + qwords.join(" ") + " ";
+    var named = [], partial = [];                      // {spec, score} per parameter, by strength of the hit
+    (knowledgeIndex.parameters || []).forEach(function (p) {
       var probes = [p.label].concat(p.aliases || []);
-      var hits = 0, best = 0;
+      var hits = 0, longestProbe = 0, longestRun = 0;  // whole names that appeared, and the best partial run
       for (var i = 0; i < probes.length; i++) {
-        var probe = (probes[i] || "").toLowerCase().trim();
-        if (probe.length >= 3 && ql.indexOf(probe) !== -1) { hits++; best = Math.max(best, probe.length); }
+        var pw = nameWords(probes[i]);
+        if (!pw.length) continue;
+        // The whole name, verbatim. Single-word probes keep the >= 3 floor so an "R" cannot fire on anything.
+        if (pw.length === 1 ? (pw[0].length >= 3 && qwords.indexOf(pw[0]) !== -1)
+                            : qjoin.indexOf(" " + pw.join(" ") + " ") !== -1) {
+          hits++; longestProbe = Math.max(longestProbe, probes[i].length); continue;
+        }
+        // Else the longest suffix run of >= 2 words: leading qualifiers alone name nothing.
+        for (var start = 0; start <= pw.length - 2; start++) {
+          if (qjoin.indexOf(" " + pw.slice(start).join(" ") + " ") !== -1) { longestRun = Math.max(longestRun, pw.length - start); break; }
+        }
       }
-      if (hits > 0) matched.push({ spec: p, score: hits * 1000 + best });
+      // hits dominates (x1000) so probe count outranks length; longestProbe only separates equal-hit parameters.
+      if (hits > 0) named.push({ spec: p, score: hits * 1000 + longestProbe });
+      // A whole name always beats a partial one, so a parameter that has one is never listed as the other.
+      else if (longestRun > 0) partial.push({ spec: p, score: longestRun });
     });
-    matched.sort(function (a, b) { return b.score - a.score; });
-    return matched.slice(0, MAX_RETURNED_PARAMETERS).map(function (m) { return m.spec; });
+    var rank = function (list) {
+      return list.sort(function (a, b) { return b.score - a.score; })
+        .slice(0, MAX_RETURNED_PARAMETERS).map(function (m) { return m.spec; });
+    };
+    return { named: rank(named), partial: rank(partial) };
   }
 
   var _tokenOwnersCache = null;
   var _anchorVocabCache = null;
+  var _headOwnersCache = null;
 
-  // Content tokens (>2 chars) used for term disambiguation.
+  // Content tokens (>2 chars) for term disambiguation; unlike tokenize() it splits on '.' and keeps stopwords.
   function disambigTokens(text) {
     var out = Object.create(null);
     (String(text || "").toLowerCase().match(/[a-z0-9_]+/g) || []).forEach(function (t) {
@@ -375,7 +472,7 @@
   function tokenOwners() {
     if (_tokenOwnersCache) return _tokenOwnersCache;
     var owners = Object.create(null);
-    (idx.parameters || []).forEach(function (p) {
+    (knowledgeIndex.parameters || []).forEach(function (p) {
       disambigTokens([p.label].concat(p.aliases || []).join(" ")).forEach(function (t) {
         (owners[t] = owners[t] || Object.create(null))[p.id] = 1;
       });
@@ -384,30 +481,186 @@
     return owners;
   }
 
-  // Fork the parameters an ambiguous shared term leaves open (two-phase).
-  function termFork(question, matchedSpecs) {
+  // Head nouns (last word of a label/alias) keyed to the parameters they HEAD, not the ones they merely contain.
+  function headOwners() {
+    if (_headOwnersCache) return _headOwnersCache;
+    var heads = Object.create(null);
+    (knowledgeIndex.parameters || []).forEach(function (p) {
+      [p.label].concat(p.aliases || []).forEach(function (entry) {
+        var words = String(entry || "").toLowerCase().match(/[a-z0-9_]+/g) || [];
+        var last = words.length ? words[words.length - 1] : null;
+        if (last && last.length > 2) (heads[last] = heads[last] || Object.create(null))[p.id] = 1;
+      });
+    });
+    _headOwnersCache = heads;
+    return heads;
+  }
+
+  // Fork the parameters an ambiguous term leaves open. poolSpecs is the fork pool, not the answer's specs.
+  function forkCandidates(question, poolSpecs) {
     var owners = tokenOwners();
-    var owned = disambigTokens(question).filter(function (t) { return owners[t]; }).map(function (t) { return owners[t]; });
-    var ambiguous = owned.filter(function (o) { return Object.keys(o).length >= 2; });
-    if (!ambiguous.length) return [];
+    var heads = headOwners();
+    var ownerSets = disambigTokens(question).filter(function (t) { return owners[t]; }).map(function (t) { return owners[t]; });
+    // Only a head noun may CREATE a fork; a family qualifier ('stimulus') may only narrow one.
+    var seedSets = disambigTokens(question).filter(function (t) {
+      return heads[t] && Object.keys(heads[t]).length >= 2;
+    }).map(function (t) { return heads[t]; });
+    if (!seedSets.length) return [];
     var candSet = Object.create(null);
-    Object.keys(ambiguous[0]).forEach(function (pid) {
-      if (ambiguous.every(function (o) { return o[pid]; })) candSet[pid] = 1;
+    Object.keys(seedSets[0]).forEach(function (pid) {
+      if (seedSets.every(function (o) { return o[pid]; })) candSet[pid] = 1;
     });
     if (Object.keys(candSet).length < 2) return [];
-    owned.forEach(function (o) {
+    ownerSets.forEach(function (o) {
       var keys = Object.keys(candSet);
       var overlap = keys.filter(function (pid) { return o[pid]; });
+      // Narrow only on a proper, non-empty overlap: a term covering all candidates (or none) discriminates nothing.
       if (overlap.length > 0 && overlap.length < keys.length) {
         candSet = Object.create(null);
         overlap.forEach(function (pid) { candSet[pid] = 1; });
       }
     });
-    var hits = (matchedSpecs || []).filter(function (spec) { return candSet[spec.id]; });
-    return hits.length >= 2 ? hits.slice(0, 4) : [];
+    // A fork may only offer parameters retrieval judged plausible -- never one the matcher did not surface.
+    var forkSpecs = (poolSpecs || []).filter(function (spec) { return candSet[spec.id]; });
+    if (forkSpecs.length < 2) return [];
+    // Candidates under one parent are facets of one setting; only a term spanning two parents forks.
+    var parents = Object.create(null);
+    forkSpecs.forEach(function (spec) { parents[String(spec.id).split(".").slice(0, -1).join(".")] = 1; });
+    if (Object.keys(parents).length < 2) return [];
+    return forkSpecs.slice(0, 4);
   }
 
-  // Name each forked parameter so the user can pick one.
+  var FORK_SUBJECT_SYSTEM =
+    "You triage questions for a GEM-pRF configuration assistant. A word in the user's message matches " +
+    "more than one configuration setting, and the assistant must decide whether to ask which one they " +
+    "mean or simply answer.\n" +
+    "Answer YES only if one of those settings is what the user is ASKING ABOUT -- so that knowing which " +
+    "one they mean would change the answer.\n" +
+    "Answer NO when the word appears only in passing and the question is really about something else: " +
+    "what a tool, script, page or file does; how something behaves, runs or is installed; a licence, a " +
+    "citation, a version. In those cases the question has its own subject and the matching word is " +
+    "merely part of the description.\n" +
+    "Reply with exactly one word: YES or NO.";
+
+  // True when the forked settings are what the question is ABOUT. Fails closed; `complete` is injectable for tests.
+  function forkIsTheSubject(question, fork, complete) {
+    if (!fork || !fork.length) return Promise.resolve(true);
+    var labels = fork.map(function (spec) { return spec.label; }).join(", ");
+    return (complete || chatComplete)([
+      { role: "system", content: FORK_SUBJECT_SYSTEM },
+      { role: "user", content: "Settings the word matches: " + labels + "\n\nQuestion: " + question }
+    ]).then(function (t) { return (t || "").trim().toUpperCase().indexOf("NO") !== 0; })
+      .catch(function () { return true; });
+  }
+
+  // Every word a parameter answers to, across its label and aliases.
+  function surfaceWords(spec) {
+    var out = Object.create(null);
+    [spec.label].concat(spec.aliases || []).forEach(function (s) {
+      nameWords(s).forEach(function (w) { out[w] = 1; });
+    });
+    return out;
+  }
+
+  // Levenshtein distance, abandoned once the whole row exceeds `max`.
+  function withinEdits(word, target, max) {
+    if (Math.abs(word.length - target.length) > max) return false;
+    var prev = [], cur = [], j;
+    for (j = 0; j <= target.length; j++) prev[j] = j;
+    for (var i = 1; i <= word.length; i++) {
+      cur[0] = i;
+      var rowBest = i;
+      for (j = 1; j <= target.length; j++) {
+        var cost = word.charAt(i - 1) === target.charAt(j - 1) ? 0 : 1;
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+        if (cur[j] < rowBest) rowBest = cur[j];
+      }
+      // Whole row over budget, so no continuation comes back under it.
+      if (rowBest > max) return false;
+      var swap = prev; prev = cur; cur = swap;
+    }
+    return prev[target.length] <= max;
+  }
+
+  // No edits under 5 chars, where one edit reaches a different word ('grid'/'grip').
+  function editBudget(word) { return word.length >= 8 ? 2 : word.length >= 5 ? 1 : 0; }
+
+  // A reply word matches a surface word outright or by a spelling slip -- 'spetial' is 'spatial'.
+  function replySays(replyWords, surfaceWord) {
+    var budget = editBudget(surfaceWord);
+    for (var i = 0; i < replyWords.length; i++) {
+      if (replyWords[i] === surfaceWord) return true;
+      if (budget && withinEdits(replyWords[i], surfaceWord, budget)) return true;
+    }
+    return false;
+  }
+
+  var ORDINAL_WORDS = { first: 0, "1st": 0, second: 1, "2nd": 1, third: 2, "3rd": 2 };
+
+  // Menu-answer filler. Deliberately not in STOPWORDS, which would change every BM25 score.
+  var SELECTION_NOISE = new Set("one ones option options setting settings choice choose pick mean meant want please".split(" "));
+
+  // People answer a two-item menu positionally. The menu order IS fork order, which is what they saw.
+  function resolveForkOrdinal(reply, fork) {
+    var words = nameWords(reply), idx = null;
+    for (var i = 0; i < words.length && idx === null; i++) {
+      if (ORDINAL_WORDS[words[i]] !== undefined) idx = ORDINAL_WORDS[words[i]];
+    }
+    // A bare number only: '2' alone is a choice, but the 2 in 'about 2 degrees' is a value.
+    if (idx === null && /^\s*[1-9]\s*$/.test(reply)) idx = parseInt(reply, 10) - 1;
+    return (idx !== null && idx >= 0 && idx < fork.length) ? fork[idx] : null;
+  }
+
+  // Which candidate a reply picks, by the words that tell them apart; null when it names none or splits.
+  function resolveForkReply(reply, fork) {
+    if (!fork || fork.length < 2) return null;
+    // Positional answers carry no label words at all, so they must be read before the word scoring.
+    var byOrdinal = resolveForkOrdinal(reply, fork);
+    if (byOrdinal) return byOrdinal;
+    var replyWords = nameWords(reply);
+    var surfaces = fork.map(surfaceWords);
+    // A word every candidate answers to cannot discriminate -- 'radius' is both a grid label and a stimulus alias.
+    var discriminates = function (w) { return !surfaces.every(function (s) { return s[w]; }); };
+    var best = null, bestScore = 0, tied = false;
+    surfaces.forEach(function (surf, i) {
+      var score = Object.keys(surf).filter(function (w) { return discriminates(w) && replySays(replyWords, w); }).length;
+      if (score > bestScore) { bestScore = score; best = fork[i]; tied = false; }
+      else if (score === bestScore && score > 0) tied = true;
+    });
+    return (best && !tied) ? best : null;
+  }
+
+  // Fold the reply in as a correction naming the pick, not as an appended annotation.
+  function foldClarifyReply(original, reply, fork, asked) {
+    var picked = resolveForkReply(reply, fork);
+    // Restate the question with the reply, since '8' is inert alone.
+    if (!picked) {
+      return (asked && !(fork && fork.length >= 2))
+        ? original + " -- in answer to \"" + asked + "\": " + reply
+        : original + " (" + reply + ")";
+    }
+    // Rejected candidates are referred to, never named, or each becomes a named hit next turn.
+    var others = fork.length - 1;
+    var folded = original + " -- I mean the " + picked.label + " setting, not " +
+      (others === 1 ? "the other one" : "the others") + ".";
+    // Keep the reply too unless it did nothing but select -- 'stimulus, 10 degrees' still carries the 10 degrees.
+    var extra = nameWords(reply).filter(function (w) { return !STOPWORDS.has(w); });
+    var surfWords = Object.keys(surfaceWords(picked));
+    // Same tolerance the resolver used, or a reply it read as a pick is echoed back as leftover content.
+    var selects = function (w) {
+      if (SELECTION_NOISE.has(w) || ORDINAL_WORDS[w] !== undefined || /^[1-9]$/.test(w)) return true;
+      return surfWords.some(function (s) { return w === s || (editBudget(s) && withinEdits(w, s, editBudget(s))); });
+    };
+    var onlySelects = extra.length > 0 && extra.every(selects);
+    return folded + (onlySelects ? "" : " " + reply);
+  }
+
+  // Second ask, after a reply named none of the candidates: number them so a positional answer works.
+  function forkReaskQuestion(fork) {
+    var numbered = fork.map(function (s, i) { return (i + 1) + ") " + s.label; }).join("   ");
+    return "Sorry -- I couldn't tell which of those you meant. Pick one by name or number: " + numbered;
+  }
+
   function forkQuestion(fork) {
     var labels = fork.map(function (spec) { return spec.label; });
     var joined = labels.length === 2 ? labels[0] + " or " + labels[1]
@@ -415,11 +668,11 @@
     return "GEM-pRF has more than one setting that matches that -- which do you mean: " + joined + "?";
   }
 
-  // Terms that identify a specific parameter.
+  // Three surfaces from labels+aliases: single-word tokens, whole phrases, and a glue form ('maxsigma').
   function anchorVocab() {
     if (_anchorVocabCache) return _anchorVocabCache;
     var tokens = Object.create(null), phrases = [], collapsed = [];
-    (idx.parameters || []).forEach(function (p) {
+    (knowledgeIndex.parameters || []).forEach(function (p) {
       [p.label].concat(p.aliases || []).forEach(function (entry) {
         var words = disambigTokens(entry);
         if (words.length === 1) {
@@ -437,47 +690,52 @@
 
   // True when the question anchors to one specific setting.
   function namesParameter(question) {
-    var v = anchorVocab();
+    var vocab = anchorVocab();
     var low = String(question || "").toLowerCase();
-    if (disambigTokens(question).some(function (t) { return v.tokens[t]; })) return true;
-    if (v.phrases.some(function (ph) { return low.indexOf(ph) !== -1; })) return true;
+    if (disambigTokens(question).some(function (t) { return vocab.tokens[t]; })) return true;
+    if (vocab.phrases.some(function (ph) { return low.indexOf(ph) !== -1; })) return true;
     var compact = low.replace(/[^a-z0-9]/g, "");
-    return v.collapsed.some(function (c) { return compact.indexOf(c) !== -1; });
+    return vocab.collapsed.some(function (c) { return compact.indexOf(c) !== -1; });
   }
 
   // Fixed value-choice clarify asking the user's goal (fallback template).
-  function valueClarifyingQuestion(fork, namesSetting) {
-    var goal = "what are you optimizing for -- accuracy, runtime, or GPU memory?";
-    if (fork.length) {
-      var labels = fork.map(function (spec) { return spec.label; });
-      var which = labels.length === 2 ? labels[0] + " or " + labels[1]
-        : labels.slice(0, -1).join(", ") + ", or " + labels[labels.length - 1];
-      return "GEM-pRF has more than one setting that matches that -- which do you mean: " + which + "? And " + goal;
-    }
+  function valueClarifyFallback(fork, namesSetting) {
+    var goal = "what are you optimizing for -- " + GOAL_TRIAD + "?";
+    // One source for the fork sentence, shared with generateValueClarify, so the two wordings cannot drift.
+    if (fork.length) return forkQuestion(fork) + " And " + goal;
     if (namesSetting) return "That depends on your goal -- " + goal + " (Or say 'just the default' for the documented value.)";
     return "Which setting are you choosing a value for, and " + goal + " (Or name the setting and say 'just the default'.)";
   }
 
-  // Generate a context-tailored value-choice clarifying question.
-  function generateValueClarify(question, ret, fork) {
-    var focus = fork.length ? fork : (ret.specs || []).slice(0, 1);
-    var evidence = (ret.chunks || []).slice(0, 3)
-      .map(function (c) { return "- " + (c.heading || c.source_id) + ": " + c.text.split(/\s+/).join(" ").slice(0, 260); })
+  // Drop an ordinary leading capital so a sentence reads after "... And"; an acronym ("GPU memory") keeps its.
+  function uncapitalize(text) {
+    return /^[A-Z][a-z]/.test(text) ? text.charAt(0).toLowerCase() + text.slice(1) : text;
+  }
+
+  function generateValueClarify(question, retrieval, fork) {
+    var focusSpecs = fork.length ? fork : (retrieval.specs || []).slice(0, 1);
+    // Nothing matched: tailoring to a "- none" setting block invents an angle, so ask the fixed question instead.
+    if (!focusSpecs.length) return Promise.resolve(valueClarifyFallback(fork, namesParameter(question)));
+    // Wide enough to tell a rule from a bare direction; 260 chars truncated the deciding sentence.
+    var evidence = (retrieval.chunks || []).slice(0, 5)
+      .map(function (c) { return "- " + (c.heading || c.source_id) + ": " + c.text.split(/\s+/).join(" ").slice(0, 600); })
       .join("\n") || "- none";
     var human = "User question: " + question + "\n\nThe setting the user is asking about:\n" +
-      parameterContext(focus) + "\n\nWhat the documentation says:\n" + evidence +
-      (fork.length ? "\n\nDistinct settings that match the user's term (ask which one they mean): " +
-        fork.map(function (s) { return s.label; }).join(", ") : "") +
+      parameterContext(focusSpecs) + "\n\nWhat the documentation says:\n" + evidence +
+      // Which setting they mean is prepended below, so the model is told not to spend its one question on it.
+      (fork.length ? "\n\nWhich of these the user means is ALREADY being asked, ahead of your question -- do " +
+        "not ask it again: " + fork.map(function (s) { return s.label; }).join(", ") : "") +
       "\n\nYour one clarifying question:";
     return chatComplete([
       { role: "system", content: VALUE_CLARIFY_SYSTEM },
       { role: "user", content: human }
     ]).then(function (t) {
       t = (t || "").replace(/^["'`]+|["'`]+$/g, "").trim();
-      return t || valueClarifyingQuestion(fork, namesParameter(question));
-    }).catch(function () { return valueClarifyingQuestion(fork, namesParameter(question)); });
+      if (!t) return valueClarifyFallback(fork, namesParameter(question));
+      // Only ever ONE clarify turn, so the fork sentence is prepended rather than left to the model.
+      return fork.length ? forkQuestion(fork) + " And " + uncapitalize(t) : t;
+    }).catch(function () { return valueClarifyFallback(fork, namesParameter(question)); });
   }
-
 
   function embedPrefix(model, kind) {
     var m = (model || "").toLowerCase();
@@ -494,13 +752,14 @@
     return v;
   }
 
+  // Every vector reaching here is L2-normalized, so this dot product IS the cosine.
   function dot(a, b) {
     var s = 0, n = Math.min(a.length, b.length);
     for (var i = 0; i < n; i++) s += a[i] * b[i];
     return s;
   }
 
-  // int8-quantized: full-float JSON overflows the ~5MB localStorage quota; the ~1/127 error is negligible for cosine ranking.
+  // int8: full-float JSON overflows the ~5MB localStorage quota, and ~1/127 error is negligible here.
   function encodeVectors(vecs) {
     if (!vecs.length) return "0:";
     var dim = vecs[0].length, i8 = new Int8Array(vecs.length * dim);
@@ -511,12 +770,12 @@
         i8[i * dim + j] = q > 127 ? 127 : (q < -128 ? -128 : q);
       }
     }
+    // 32k chars at a time: String.fromCharCode.apply blows the argument limit on a full corpus in one call.
     var u8 = new Uint8Array(i8.buffer), CH = 0x8000, s = "";
     for (var k = 0; k < u8.length; k += CH) s += String.fromCharCode.apply(null, u8.subarray(k, k + CH));
     return dim + ":" + btoa(s);
   }
 
-  // Decode the int8 vector cache back to unit Float32 vectors.
   function decodeVectors(str, expectedCount) {
     try {
       var sep = str.indexOf(":");
@@ -537,10 +796,11 @@
     } catch (e) { return null; }
   }
 
-  // Embed texts via the visitor's Ollama (batch, legacy fallback).
+  // Embed texts via the visitor's Ollama (batch, legacy fallback). Rows, chunks and queries all fold here.
   function ollamaEmbed(model, texts, kind) {
     var pref = embedPrefix(model, kind);
-    var inputs = texts.map(function (t) { return pref + t; });
+    // Case-folded: nomic cosines a Title Case string at 0.55 against its own lowercase form.
+    var inputs = texts.map(function (t) { return pref + String(t).toLowerCase(); });
     return fetch(OLLAMA + "/api/embed", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -564,7 +824,6 @@
     });
   }
 
-  // Pick the embedding model to use, if any is installed.
   function pickEmbedModel(available) {
     if (!available.length) return null;
     if (available.indexOf(PREFERRED_EMBED) !== -1) return PREFERRED_EMBED;
@@ -578,15 +837,15 @@
   }
 
   // Embed the corpus chunks once, cached by (corpus_sha, model).
-  function buildChunkVectors(onCompute) {
-    var cacheKey = "gpa:vec2:" + idx.meta.corpus_sha + ":" + embedModel;
+  function buildChunkVectors(onCacheMiss) {
+    var cacheKey = "gpa:vec3:" + knowledgeIndex.meta.corpus_sha + ":" + embedModel;
     try {
-      var decoded = decodeVectors(localStorage.getItem(cacheKey) || "", idx.chunks.length);
+      var decoded = decodeVectors(localStorage.getItem(cacheKey) || "", knowledgeIndex.chunks.length);
       if (decoded) { chunkVectors = decoded; return Promise.resolve(true); }
     } catch (e) {  }
 
-    if (onCompute) onCompute();
-    var texts = idx.chunks.map(function (c) { return c.heading + "\n" + c.text; });
+    if (onCacheMiss) onCacheMiss();
+    var texts = knowledgeIndex.chunks.map(function (c) { return c.heading + "\n" + c.text; });
     return ollamaEmbed(embedModel, texts, "doc").then(function (vecs) {
       chunkVectors = vecs;
       try { localStorage.setItem(cacheKey, encodeVectors(vecs)); } catch (e) {  }
@@ -594,11 +853,11 @@
     });
   }
 
-  // Embed the parameter-catalog rows once (cached like the chunks).
+  // Cached by POSITION and guarded only by row count, so buildParamRows must stay deterministic.
   function buildParamVectors() {
-    var rows = paramRowTexts();
+    var rows = buildParamRows();
     if (!rows.length) { paramRows = []; return Promise.resolve(true); }
-    var cacheKey = "gpa:pvec2:" + idx.meta.corpus_sha + ":" + embedModel;
+    var cacheKey = "gpa:pvec3:" + knowledgeIndex.meta.corpus_sha + ":" + embedModel;
     try {
       var decoded = decodeVectors(localStorage.getItem(cacheKey) || "", rows.length);
       if (decoded) { for (var i = 0; i < rows.length; i++) rows[i].vec = decoded[i]; paramRows = rows; return Promise.resolve(true); }
@@ -611,8 +870,7 @@
     }).catch(function () { paramRows = null; return false; });
   }
 
-
-  function minmax(arr) {
+  function minmaxNormalize(arr) {
     var lo = Infinity, hi = -Infinity;
     for (var i = 0; i < arr.length; i++) { if (arr[i] < lo) lo = arr[i]; if (arr[i] > hi) hi = arr[i]; }
     var rng = hi - lo, out = new Array(arr.length);
@@ -620,83 +878,214 @@
     return out;
   }
 
-  // Fuse semantic and BM25 scores (min-max, alpha blend).
-  function fuse(bm25Scores, semScores) {
+  // Per-model cosine floor from the index: each model sits on its own band (nomic off-topic ~0.52, not ~0).
+  function modelFloor(tableName, fallback) {
+    var table = (knowledgeIndex && knowledgeIndex.meta && knowledgeIndex.meta[tableName]) || null;
+    if (!table) return fallback;
+    var m = (embedModel || "").toLowerCase();
+    var key = Object.keys(table).filter(function (k) { return k !== "default" && m.indexOf(k) !== -1; })[0];
+    if (key && typeof table[key] === "number") return table[key];
+    return typeof table["default"] === "number" ? table["default"] : fallback;
+  }
+
+  // Below this the corpus holds no evidence; the fallback sits low so an unmeasured model under-refuses.
+  var DEFAULT_EVIDENCE_FLOOR = 0.55;
+  function evidenceFloor() { return modelFloor("evidence_floor", DEFAULT_EVIDENCE_FLOOR); }
+
+  // Below this, the question is judged to name no parameter -- see matchParametersEmbedding.
+  function parameterFloor() { return modelFloor("parameter_floor", DEFAULT_PARAMETER_FLOOR); }
+
+  // Min-max normalises each side, so absolute similarity does not survive this call -- read the raw arrays first.
+  function blendScores(bm25Scores, semScores) {
     if (!semScores) return bm25Scores;
-    var nb = minmax(bm25Scores), ns = minmax(semScores);
+    var nb = minmaxNormalize(bm25Scores), ns = minmaxNormalize(semScores);
     var out = new Array(bm25Scores.length);
     for (var i = 0; i < out.length; i++) out[i] = HYBRID_ALPHA * ns[i] + (1 - HYBRID_ALPHA) * nb[i];
     return out;
   }
 
-  // Retrieve evidence + matched params: hybrid, or BM25-only without embeddings.
-  function retrieve(question) {
-    var haveEmbed = embedModel && chunkVectors && paramRows;
-    var qPromise = haveEmbed
-      ? ollamaEmbed(embedModel, [question], "query").then(function (qv) { return qv[0]; }).catch(function () { return null; })
-      : Promise.resolve(null);
+  // Borrowed-vocabulary weight for query expansion; the user's own words carry 1.
+  var EXPANSION_WEIGHT = 0.6;
+  // A literal name outranks every cosine the embedder can produce.
+  var NAME_MATCH_SCORE = 1.0;
+  // Per-source cap: at TOP_K 6, a cap of 3 let one source hold half the evidence. See tests/RETRIEVAL.md.
+  var MAX_PER_SOURCE = 2;
 
-    return qPromise.then(function (qVec) {
-      var matched;
-      if (qVec) {
-        matched = matchParametersEmbedding(qVec);
-        // Literal name = confident match (1.0): nomic embeds rare acronyms (e.g. nDCT) poorly.
-        matchParametersSubstring(question).forEach(function (spec) {
-          if (matched.scores[spec.id] === undefined) matched.specs.push(spec);
-          matched.scores[spec.id] = 1.0;
-        });
-        matched.specs.sort(function (a, b) { return (matched.scores[b.id] || 0) - (matched.scores[a.id] || 0); });
-        matched.specs = matched.specs.slice(0, MAX_RETURNED_PARAMETERS);
-      } else {
-        matched = { specs: matchParametersSubstring(question), scores: {} };
-        matched.specs.forEach(function (s) { matched.scores[s.id] = 1.0; });
-      }
-      var matchedSpecs = matched.specs;
-
-      var weights = Object.create(null);
-      tokenize(question).forEach(function (t) { weights[t] = Math.max(weights[t] || 0, 1); });
-      var expansionWords = [];
-      matchedSpecs.forEach(function (p) {
-        tokenize([p.label, (p.aliases || []).join(" "), p.summary].join(" ")).forEach(function (t) {
-          if (!(t in weights)) expansionWords.push(t);
-          weights[t] = Math.max(weights[t] || 0, 0.6);
-        });
-      });
-      var bm25Scores = bm25Score(bm25, weights);
-      var semScores = qVec ? chunkVectors.map(function (cv) { return dot(qVec, cv); }) : null;
-
-      var fused = fuse(bm25Scores, semScores);
-      var ranked = [];
-      for (var i = 0; i < fused.length; i++) {
-        if (fused[i] > 0) ranked.push({ i: i, score: fused[i] });
-      }
-      ranked.sort(function (a, b) { return b.score - a.score; });
-
-      var perSource = Object.create(null);
-      var picked = [];
-      for (var r = 0; r < ranked.length && picked.length < TOP_K; r++) {
-        var c = idx.chunks[ranked[r].i];
-        var sid = c.source_id || "?";
-        if ((perSource[sid] || 0) >= 3) continue;
-        perSource[sid] = (perSource[sid] || 0) + 1;
-        picked.push(c);
-      }
-      return { chunks: picked, specs: matchedSpecs, paramScores: matched.scores, expansion: expansionWords,
-               mode: semScores ? "hybrid" : "bm25" };
-    });
+  // Embed the question, or say why not: 'unconfigured' (nothing to score against) vs 'embed-failed'.
+  function embedQuery(question) {
+    if (!embedModel || (!chunkVectors && !paramRows)) return Promise.resolve({ vec: null, degraded: "unconfigured" });
+    // "query" selects the search_query prefix, not the search_document one used at index time.
+    return ollamaEmbed(embedModel, [question], "query")
+      // The catch collapses a failed embed into a degraded turn rather than a dead one.
+      .then(function (qv) { return { vec: qv[0], degraded: null }; })
+      .catch(function () { return { vec: null, degraded: "embed-failed" }; });
   }
 
+  // Fuse the matchers into one ranking: names always run as the net under cosine, cosine when it can.
+  function matchParameters(question, qVec) {
+    var byName = matchParametersByName(question);
+    var cosine = (qVec && paramRows) ? matchParametersEmbedding(qVec) : { specs: [], scores: {}, pool: [] };
+    // Null-prototype so a parameter id like 'constructor' cannot collide.
+    var scores = Object.create(null);
+    var fused = [];
+    cosine.specs.forEach(function (s) { scores[s.id] = cosine.scores[s.id]; fused.push(s); });
+    // A literal name is confident: nomic embeds rare acronyms (nDCT) poorly, so this overwrites a real cosine.
+    byName.named.forEach(function (s) {
+      if (scores[s.id] === undefined) fused.push(s);
+      scores[s.id] = NAME_MATCH_SCORE;
+    });
+    // Sort is stable, so equal scores keep insertion order: cosine rank, then name rank.
+    fused.sort(function (a, b) { return scores[b.id] - scores[a.id]; });
+    // Pool = cosine order, then rescues and partials; a partial may ask which setting is meant, never cite.
+    var forkPool = cosine.pool.slice();
+    var inPool = Object.create(null);
+    forkPool.forEach(function (s) { inPool[s.id] = 1; });
+    fused.concat(byName.partial).forEach(function (s) { if (!inPool[s.id]) { inPool[s.id] = 1; forkPool.push(s); } });
+    // The citing cut comes AFTER the pool merge: forkPool keeps the candidates it drops.
+    return { cited: fused.slice(0, MAX_RETURNED_PARAMETERS), forkPool: forkPool, scores: scores };
+  }
+
+  // term -> weight maps for the two BM25 passes; null-prototype so a token like 'constructor' cannot collide.
+  function expansionWeights(question, specs) {
+    var own = Object.create(null);
+    tokenize(question).forEach(function (t) { own[t] = 1; });
+    var expanded = Object.create(null);
+    Object.keys(own).forEach(function (t) { expanded[t] = own[t]; });
+    // Borrowed terms actually added, for callers that want to see why a chunk ranked.
+    var words = [];
+    // Borrow vocabulary from matched parameters so their chunks score even if worded differently.
+    specs.forEach(function (p) {
+      tokenize([p.label, (p.aliases || []).join(" "), p.summary].join(" ")).forEach(function (t) {
+          if (!(t in expanded)) words.push(t);
+        // max() rather than assignment: expansion may never dilute a term the user typed.
+        expanded[t] = Math.max(expanded[t] || 0, EXPANSION_WEIGHT);
+      });
+    });
+    return { own: own, expanded: expanded, words: words };
+  }
+
+  // Own words, plus at most that much again borrowed: expansion may amplify a chunk, never carry one in alone.
+  function cappedExpansionScores(w) {
+    var ownScores = scoreChunksBm25(bm25, w.own);
+    var expandedScores = scoreChunksBm25(bm25, w.expanded);
+    return ownScores.map(function (own, i) { return own + Math.min(expandedScores[i] - own, own); });
+  }
+
+  // Per-chunk scores; semScores null means lexical-only, which also selects the 'bm25' mode label.
+  function scoreEvidence(question, qVec, citedSpecs) {
+    var w = expansionWeights(question, citedSpecs);
+    return {
+      bm25Scores: cappedExpansionScores(w),
+      semScores: (qVec && chunkVectors) ? chunkVectors.map(function (cv) { return dot(qVec, cv); }) : null,
+      expansion: w.words
+    };
+  }
+
+  // Trim a score-ranked list to `limit` with at most `cap` chunks per source -- the Python sibling is _diverse_topk.
+  function diverseTopK(ranked, limit, cap) {
+    var perSource = Object.create(null);
+    var picked = [];
+    for (var r = 0; r < ranked.length && picked.length < limit; r++) {
+      var c = knowledgeIndex.chunks[ranked[r].chunkIndex];
+      var sid = c.source_id || "?";
+      if ((perSource[sid] || 0) >= cap) continue;
+      perSource[sid] = (perSource[sid] || 0) + 1;
+      picked.push(c);
+    }
+    return picked;
+  }
+
+  // Evidence floor, blend, rank, diversity cut. empty:true means the corpus holds nothing for this question.
+  function selectChunks(evidence) {
+    // Maxima must be read before blendScores: min-max maps the best cosine to 1.0, erasing magnitude.
+    var maxCos = evidence.semScores ? Math.max.apply(null, evidence.semScores) : 0;
+    var maxBm25 = evidence.bm25Scores.length ? Math.max.apply(null, evidence.bm25Scores) : 0;
+    // Abstain only when BOTH signals are silent; the gate needs cosine, so it never fires in bm25 mode.
+    if (evidence.semScores && maxCos < evidenceFloor() && maxBm25 <= 0) {
+      return { chunks: [], maxCos: maxCos, maxBm25: maxBm25, empty: true };
+    }
+    var blended = blendScores(evidence.bm25Scores, evidence.semScores);
+    var ranked = [];
+    for (var i = 0; i < blended.length; i++) {
+      if (blended[i] > 0) ranked.push({ chunkIndex: i, score: blended[i] });
+    }
+    ranked.sort(function (a, b) { return b.score - a.score; });
+    return { chunks: diverseTopK(ranked, TOP_K, MAX_PER_SOURCE), maxCos: maxCos, maxBm25: maxBm25, empty: false };
+  }
+
+  // The only place the record is built, so the gated-empty shape cannot drift from the full one.
+  function retrievalResult(q, params, evidence, picked) {
+    // The floor gate empties the parameters too: an off-topic question must not seed a fork clarify.
+    var gated = picked.empty;
+    return {
+      chunks: picked.chunks,
+      specs: gated ? [] : params.cited,
+      forkPool: gated ? [] : params.forkPool,
+      paramScores: gated ? {} : params.scores,
+      expansion: gated ? [] : evidence.expansion,
+      mode: evidence.semScores ? "hybrid" : "bm25",
+      degraded: q.degraded,
+      maxCos: picked.maxCos, maxBm25: picked.maxBm25
+    };
+  }
+
+  // Retrieve evidence + matched params: hybrid, or BM25-only without embeddings.
+  function retrieve(question) {
+    return embedQuery(question).then(function (q) {
+      // Stages branch on q.vec, never on configuration: a per-query embed failure degrades identically.
+      var params = matchParameters(question, q.vec);
+      var evidence = scoreEvidence(question, q.vec, params.cited);
+      var picked = selectChunks(evidence);
+      return retrievalResult(q, params, evidence, picked);
+    });
+  }
 
   function capText(text, cap) {
     if (cap <= 0 || text.length <= cap) return text;
     return text.slice(0, cap).replace(/\s+\S*$/, "") + " …";
   }
 
+  // Classify from the index: source_id prefixes left 254 chunks untyped and read XML samples as prose.
+  var EVIDENCE_CLASS_BY_KIND = {
+    paper: "prose", website: "prose", markdown: "prose", config: "sample", code: "code"
+  };
+  // `repo` is a grab-bag of all three: a README, a utility module, and a sample config.
+  var EVIDENCE_CLASS_BY_SOURCE = {
+    "repo.readme": "prose", "repo.gpu_info": "code", "repo.sample_config": "sample"
+  };
+
+  // Unknown kinds fall to `code`: least authority for the three gated classes, valid grounding everywhere else.
+  function evidenceClass(sourceId) {
+    var byId = EVIDENCE_CLASS_BY_SOURCE[sourceId];
+    if (byId) return byId;
+    var src = (knowledgeIndex && knowledgeIndex.sources && knowledgeIndex.sources[sourceId]) || {};
+    return EVIDENCE_CLASS_BY_KIND[src.kind] || "code";
+  }
+
+  function hasProseEvidence(chunks) {
+    return chunks.some(function (c) { return evidenceClass(c.source_id) === "prose"; });
+  }
+
   function evidenceContext(chunks) {
     if (!chunks.length) return "- none";
     return chunks.map(function (c) {
-      return "[" + c.source_id + " " + c.heading + "] " + capText(c.text, EVIDENCE_CHAR_CAP);
+      return "[" + evidenceClass(c.source_id) + " | " + c.source_id + " " + c.heading + "] " +
+        capText(c.text, EVIDENCE_CHAR_CAP);
     }).join("\n\n");
+  }
+
+  // Restated below the evidence so the deciding rule is read last; only the question class is left to the model.
+  function operativeRule(chunks) {
+    if (!chunks.length) return "";
+    return "\n\nDecision reminder for this turn: " + (hasProseEvidence(chunks)
+      ? "`prose` evidence IS present above, so the source-class gate does not apply this turn. " +
+        "The general rule governs: answer if an item supports the fact, refuse if none does. " +
+        "Prose being present is not itself support -- it may address a different topic."
+      : "NO `prose` evidence was retrieved -- every item above is `sample` or `code`. If the " +
+        "question asks about UI behavior, a recommended or default value, or the runtime " +
+        "semantics of a configurator toggle, reply 'INSUFFICIENT_EVIDENCE: <one-sentence " +
+        "reason>'. For any other question class -- definitions, what fields/keys exist, code " +
+        "structure, numbers stated in the text -- answer normally from the items above.");
   }
 
   function parameterContext(specs) {
@@ -706,36 +1095,46 @@
     }).join("\n");
   }
 
-  function renderTurns() {
+  function historyTranscript() {
     return history.slice(-HISTORY_TURNS).map(function (t) {
       return "User: " + t.q + "\nAssistant: " + t.a;
     }).join("\n");
   }
 
-  function historyContext() { return history.length ? renderTurns() : "- none"; }
+  function historyContext() { return history.length ? historyTranscript() : "- none"; }
 
-  // Record an answered turn in the rolling history (capped).
+  // Last turn split out so recency is structural: a similar OLD turn used to win the referent.
+  function condenseTranscript() {
+    var turns = history.slice(-HISTORY_TURNS);
+    var last = turns[turns.length - 1];
+    var earlier = turns.slice(0, -1).map(function (t) {
+      return "User: " + t.q + "\nAssistant: " + t.a;
+    }).join("\n");
+    return (earlier ? "Earlier turns (background only, not the referent):\n" + earlier + "\n\n" : "") +
+      "MOST RECENT turn -- the referent for anything the latest question leaves unsaid:\n" +
+      "User: " + last.q + "\nAssistant: " + last.a;
+  }
+
   function recordTurn(q, a) {
     a = (a || "").split(/\s+/).join(" ").trim();
-    if (a.length > ANSWER_CHAR_CAP) a = a.slice(0, ANSWER_CHAR_CAP).replace(/\s+\S*$/, "") + " …";
+    if (a.length > HISTORY_ANSWER_CHAR_CAP) a = a.slice(0, HISTORY_ANSWER_CHAR_CAP).replace(/\s+\S*$/, "") + " …";
     history.push({ q: (q || "").trim(), a: a });
     if (history.length > HISTORY_TURNS) history = history.slice(-HISTORY_TURNS);
   }
 
-  // Build the human prompt; history feeds it only for genuine follow-ups.
-  function buildHumanPrompt(question, ret, isFollowup, allowClarify, valueAnswer) {
+  // History feeds genuine follow-ups only; the two directives exclude each other by construction.
+  function buildHumanPrompt(question, retrieval, isFollowup, allowClarify, valueAnswer) {
     return "Conversation history (reference resolution only; NOT evidence):\n" +
       (isFollowup ? historyContext() : "- none") + "\n\n" +
       "Question: " + question + "\n\n" +
-      "Expanded query (intent inference; cite from the original question only):\n" +
-      "- none" + "\n\n" +
-      "Matched parameters:\n" + parameterContext(ret.specs) + "\n\n" +
-      "Evidence (each item is `[source_id heading_path] text`):\n" + evidenceContext(ret.chunks) +
-      (allowClarify ? CLARIFY_DIRECTIVE : "") + (valueAnswer ? VALUE_ANSWER_DIRECTIVE : "");
+      "Matched parameters:\n" + parameterContext(retrieval.specs) + "\n\n" +
+      "Evidence (each item is `[class | source_id heading_path] text`):\n" + evidenceContext(retrieval.chunks) +
+      operativeRule(retrieval.chunks) +
+      (valueAnswer ? VALUE_ANSWER_DIRECTIVE : (allowClarify ? CLARIFY_DIRECTIVE : ""));
   }
 
-
-  function withTimeout(ms) {
+  // One-shot abort timer; deliberately never cleared -- aborting a settled request is a no-op.
+  function abortAfter(ms) {
     var c = new AbortController();
     setTimeout(function () { c.abort(); }, ms);
     return c;
@@ -749,42 +1148,40 @@
     return m[2] === "M" ? v / 1000 : v;
   }
 
-  // Model size in billions from /api/show, or null.
   function modelParamsB(model) {
     return fetch(OLLAMA + "/api/show", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: model }),
-      signal: withTimeout(5000).signal
+      signal: abortAfter(5000).signal
     }).then(function (r) { return r.ok ? r.json() : null; })
       .then(function (j) { return j ? parseParamsB(j.details && j.details.parameter_size) : null; })
       .catch(function () { return null; });
   }
 
-  // Probe Ollama for available chat and embedding models.
+  // Also stores the split into chatModels/embedModels, which populateModelSelect and connect read afterwards.
   function probeOllama() {
-    return fetch(OLLAMA + "/api/tags", { signal: withTimeout(3500).signal })
+    return fetch(OLLAMA + "/api/tags", { signal: abortAfter(3500).signal })
       .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
       .then(function (j) {
         var all = (j.models || []).map(function (m) { return m.name; });
         var isEmbed = function (n) { return /embed|bge|minilm|nomic|mxbai|arctic|gte|\be5\b/i.test(n); };
-        models = all.filter(function (n) { return !isEmbed(n); });
+        chatModels = all.filter(function (n) { return !isEmbed(n); });
         embedModels = all.filter(isEmbed);
-        return { ok: true, models: models, embedModels: embedModels };
+        return { ok: true, models: chatModels, embedModels: embedModels };
       })
       .catch(function (e) { return { ok: false, error: e.message || String(e) }; });
   }
 
   function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
-  // Non-streaming chat completion with timeout and retry.
   function chatComplete(messages, attempt) {
     attempt = attempt || 0;
     return fetch(OLLAMA + "/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: chatModel, messages: messages, stream: false, think: false, options: { temperature: 0 } }),
-      signal: withTimeout(LLM_TIMEOUT_MS).signal
+      signal: abortAfter(LLM_TIMEOUT_MS).signal
     }).then(function (r) {
       if (!r.ok) throw new Error("Ollama HTTP " + r.status);
       return r.json();
@@ -795,12 +1192,12 @@
       });
   }
 
-  function normQ(s) { return (s || "").toLowerCase().split(/\s+/).join(" ").replace(/^[\s?.!]+|[\s?.!]+$/g, ""); }
+  function normalizeQuestion(s) { return (s || "").toLowerCase().split(/\s+/).join(" ").replace(/^[\s?.!]+|[\s?.!]+$/g, ""); }
 
   // Fold a follow-up's referents into a standalone question before retrieval.
   function contextualize(question) {
     if (!history.length) return Promise.resolve(question);
-    var hist = renderTurns();
+    var hist = condenseTranscript();
     var messages = [
       { role: "system", content: CONDENSE_SYSTEM },
       { role: "user", content: "Conversation:\n" + hist + "\n\nLatest question: " + question + "\n\nStandalone question:" }
@@ -810,7 +1207,6 @@
     }).catch(function () { return question; });
   }
 
-  // Classify whether a value-choice question needs the user's goal first.
   function needsGoal(question) {
     return chatComplete([
       { role: "system", content: NEEDS_GOAL_SYSTEM },
@@ -828,13 +1224,13 @@
       .catch(function () { return INTERACTIVE_NO_EVIDENCE_MESSAGE; });
   }
 
-  // Stream the grounded answer token by token from the LLM.
-  function streamChat(question, ret, onToken, isFollowup, allowClarify, valueAnswer) {
+  // onPartial gets the WHOLE answer accumulated so far on every chunk, not the newest delta.
+  function streamChat(question, retrieval, onPartial, isFollowup, allowClarify, valueAnswer) {
     var body = {
       model: chatModel,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: buildHumanPrompt(question, ret, isFollowup, allowClarify, valueAnswer) }
+        { role: "user", content: buildHumanPrompt(question, retrieval, isFollowup, allowClarify, valueAnswer) }
       ],
       stream: true,
       think: false,  // = Python reasoning_effort=none
@@ -871,7 +1267,7 @@
             try { obj = JSON.parse(line); } catch (e) { continue; }
             if (obj.message && obj.message.content) {
               full += obj.message.content;
-              onToken(full);
+              onPartial(full);
             }
           }
           arm();
@@ -882,6 +1278,7 @@
     });
   }
 
+  // VERIFICATION_PHRASES match the whole normalized message; PROVENANCE_STEMS only its prefix.
   var VERIFICATION_PHRASES = {};
   ("you sure|are you sure|sure|really|seriously|for real|is that right|is that correct|is that true|" +
    "is that accurate|are you certain|you positive|that doesn't sound right|i don't believe you|" +
@@ -896,7 +1293,7 @@
    "config configuration analysis default choose use what how which does your the for").split(" ")
     .forEach(function (w) { GENERIC_TOKENS[w] = 1; });
 
-  function normalizeTurn(text) {
+  function normalizePhrase(text) {
     return (text || "").trim().replace(/^["']+|["']+$/g, "").replace(/[?!.]+$/, "")
       .toLowerCase().split(/\s+/).join(" ").trim();
   }
@@ -910,7 +1307,7 @@
   // Detect a contentless doubt/provenance follow-up ('you sure?').
   function isVerificationFollowup(question) {
     if (!history.length) return false;
-    var norm = normalizeTurn(question);
+    var norm = normalizePhrase(question);
     if (!norm || norm.split(" ").length > 10) return false;
     if (VERIFICATION_PHRASES[norm]) return true;
     for (var i = 0; i < PROVENANCE_STEMS.length; i++) {
@@ -927,22 +1324,22 @@
     return tok.replace(/^[.,!?:;"'`()]+|[.,!?:;"'`()]+$/g, "");
   }
 
-  // Non-streaming answer on a query; returns {answer, refused}.
-  function generateAnswer(question, ret) {
+  // buildHumanPrompt without isFollowup/allowClarify on purpose: the re-check stands on this retrieval alone.
+  function generateAnswer(question, retrieval) {
     return chatComplete([
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: buildHumanPrompt(question, ret) }
+      { role: "user", content: buildHumanPrompt(question, retrieval) }
     ]).then(function (raw) {
-      if (/INSUFFICIENT_EVIDENCE/i.test(raw)) return { answer: raw, refused: true };
+      if (isRefusal(raw)) return { answer: raw, refused: true };
       return { answer: raw, refused: false };
     });
   }
 
-  // Retrieve + generate on a folded query and report whether it's grounded.
-  function analyzeFold(query) {
-    return retrieve(query).then(function (ret) {
-      return generateAnswer(query, ret).then(function (g) {
-        return { ret: ret, answer: g.answer, answered: !g.refused };
+  // Fresh retrieve + non-streaming answer for the verify path; answered=false means INSUFFICIENT_EVIDENCE.
+  function retrieveAndAnswer(query) {
+    return retrieve(query).then(function (retrieval) {
+      return generateAnswer(query, retrieval).then(function (g) {
+        return { ret: retrieval, answer: g.answer, answered: !g.refused };
       });
     });
   }
@@ -964,7 +1361,6 @@
     return m ? s.slice(0, m.index + 1) : s;
   }
 
-  // Adjudicate the prior answer against fresh evidence (verify framing).
   function adjudicateConsistency(prior, fresh) {
     return chatComplete([
       { role: "system", content: ADJUDICATE_SYSTEM },
@@ -973,7 +1369,6 @@
       .catch(function () { return ""; });
   }
 
-  // Compose the verify confirm-or-correct message.
   function composeVerify(verdict, body) {
     body = (body || "").trim();
     if (verdict === "CONFIRMS") return "Yes — re-checking the sources, that holds up:\n\n" + body + VERIFY_CAVEAT;
@@ -985,28 +1380,29 @@
   function verifyPriorAnswer() {
     var prior = history[history.length - 1];
     if (!prior || !(prior.a || "").trim()) return Promise.resolve(false);
-    var seed = (prior.q + " " + firstSentence(prior.a)).trim();
-    return analyzeFold(seed).then(function (r) {
-      if (!r.answered) {
+    // The re-query carries the prior answer's first sentence, so retrieval lands on the doubted claim.
+    var recheckQuery = (prior.q + " " + firstSentence(prior.a)).trim();
+    return retrieveAndAnswer(recheckQuery).then(function (recheck) {
+      if (!recheck.answered) {
         fillBubble("I can't re-confirm that from the allowed GEM-pRF sources right now — " +
           "re-checking, I don't find support for it.");
         return true;
       }
-      return adjudicateConsistency(prior.a, r.answer).then(function (verdict) {
-        fillBubble(composeVerify(verdict, r.answer));
-        renderCitations(activeBot, r.ret.chunks);
+      return adjudicateConsistency(prior.a, recheck.answer).then(function (verdict) {
+        fillBubble(composeVerify(verdict, recheck.answer));
+        renderCitations(activeBot, recheck.ret.chunks);
         return true;
       });
     });
   }
 
-  function fillBubble(html) {
+  function fillBubble(markdown) {
     activeBot.classList.remove("gpa-cursor");
-    activeBot.innerHTML = renderMarkdown(html);
+    activeBot.innerHTML = renderMarkdown(markdown);
     scrollDown();
   }
 
-
+  // html goes in raw as innerHTML -- every caller must escape first; that is why addUserMsg uses textContent.
   function el(tag, cls, html) {
     var e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -1034,13 +1430,12 @@
     els.dot.className = "gpa-status-dot" + (state === "ok" ? " gpa-ok" : state === "busy" ? " gpa-busy" : "");
   }
 
-  // Render the source citations under an answer.
   function renderCitations(node, chunks) {
     if (!chunks.length) return;
     var seen = Object.create(null);
     var items = [];
     chunks.forEach(function (c) {
-      var src = (idx.sources && idx.sources[c.source_id]) || {};
+      var src = (knowledgeIndex.sources && knowledgeIndex.sources[c.source_id]) || {};
       var key = c.source_id;
       if (seen[key]) return;
       seen[key] = 1;
@@ -1054,9 +1449,14 @@
     node.appendChild(box);
   }
 
-  // Set the pending single-reply clarify state and show the question.
-  function askClarify(question, clarifyingQuestion, isValueChoice) {
-    pendingClarify = { question: question, valueChoice: !!isValueChoice };
+  // Pend a single-reply clarify; `fork` is kept so the reply can bind back to a candidate.
+  function askClarify(originalQuestion, clarifyingQuestion, isValueChoice, fork, reAsked) {
+    // `asked` is kept because a reply means nothing alone: '8' has no unit once the bubble scrolls away.
+    pendingClarify = {
+      question: originalQuestion, asked: clarifyingQuestion,
+      // reAsked caps the fork re-ask at one, so an unresolvable reply cannot loop the user forever.
+      valueChoice: !!isValueChoice, fork: fork || [], reAsked: !!reAsked
+    };
     fillBubble(clarifyingQuestion);
   }
 
@@ -1067,17 +1467,16 @@
     "quote, or include any code, identifiers-as-code, or pseudocode -- it is already displayed. Describe only " +
     "behaviour and purpose.";
 
-  // True when the user asks to see source code.
   function isCodeRequest(q) {
     return /\bcode\b|\bimplementation\b|\bsource[- ]?code\b/i.test(q || "");
   }
 
-  // Find the parameter the question names (id/label/alias match).
+  // Longest matching probe wins, so a multi-word label beats a short alias another parameter also carries.
   function codeParamForQuestion(question) {
     var q = " " + String(question || "").toLowerCase() + " ";
     var qSpaces = q.replace(/[_.]/g, " ");
     var best = null, bestLen = 0;
-    (idx.parameters || []).forEach(function (p) {
+    (knowledgeIndex.parameters || []).forEach(function (p) {
       var probes = p.id.toLowerCase().split(".").concat(p.id.toLowerCase(), (p.label || "").toLowerCase());
       (p.aliases || []).forEach(function (a) { probes.push((a || "").toLowerCase()); });
       probes.forEach(function (probe) {
@@ -1095,53 +1494,50 @@
   var GENERIC_CODE = {};
   "value values true false none str int float default self node key enable config param params get set data".split(" ").forEach(function (w) { GENERIC_CODE[w] = 1; });
 
-  // Trim a size-split chunk to the lines where the parameter appears (plus a little context). Prefers the
-  // quoted config-key line (the real usage) over bare mentions, so a config read isn't buried in machinery.
+  // Prefers the quoted config-key line (the real usage) over bare mentions.
   function focusExcerpt(text, terms) {
     var distinctive = terms.filter(function (w) { return w.length >= 3 && !GENERIC_CODE[w]; });
     if (!distinctive.length) return text;
     var lines = text.split("\n");
-    function hitsFor(preds) {
+    function hitsFor(needles) {
       var h = [];
-      lines.forEach(function (ln, i) { var low = ln.toLowerCase(); for (var k = 0; k < preds.length; k++) { if (low.indexOf(preds[k]) !== -1) { h.push(i); break; } } });
+      lines.forEach(function (ln, i) { var low = ln.toLowerCase(); for (var k = 0; k < needles.length; k++) { if (low.indexOf(needles[k]) !== -1) { h.push(i); break; } } });
       return h;
     }
     var quoted = [];
     distinctive.forEach(function (w) { quoted.push('"' + w + '"'); quoted.push("'" + w + "'"); });
-    var hit = hitsFor(quoted);            // the config-key line, if any
-    if (!hit.length) hit = hitsFor(distinctive);  // else any mention
-    if (!hit.length) return text;
+    var hitLines = hitsFor(quoted);            // the config-key line, if any
+    if (!hitLines.length) hitLines = hitsFor(distinctive);  // else any mention
+    if (!hitLines.length) return text;
     var CTX = 4;
-    return lines.slice(Math.max(0, hit[0] - CTX), Math.min(lines.length, hit[hit.length - 1] + CTX + 1)).join("\n");
+    return lines.slice(Math.max(0, hitLines[0] - CTX), Math.min(lines.length, hitLines[hitLines.length - 1] + CTX + 1)).join("\n");
   }
 
   // True when a chunk reads the parameter as a quoted config key -- then even the primary block is trimmed.
   function isConfigReadChunk(text, terms) {
     var low = String(text || "").toLowerCase();
-    var d = terms.filter(function (w) { return w.length >= 3 && !GENERIC_CODE[w]; });
-    for (var k = 0; k < d.length; k++) { if (low.indexOf('"' + d[k] + '"') !== -1 || low.indexOf("'" + d[k] + "'") !== -1) return true; }
+    var distinctive = terms.filter(function (w) { return w.length >= 3 && !GENERIC_CODE[w]; });
+    for (var k = 0; k < distinctive.length; k++) { if (low.indexOf('"' + distinctive[k] + '"') !== -1 || low.indexOf("'" + distinctive[k] + "'") !== -1) return true; }
     return false;
   }
 
-  // Every curated code site for the named parameter: the best chunk per source file in its code_source_ids,
-  // most param-dense first. Falls back to the single best retrieved code chunk when nothing is clearly named.
-  function findCodeChunks(question, ret) {
-    var specs = ret.specs || [];
-    var primary = codeParamForQuestion(question) || specs[0];
+  // Best chunk per code source, most param-dense first; falls back to the best retrieved code chunk.
+  function findCodeChunks(question, retrieval) {
+    var specs = retrieval.specs || [];
+    var namedSpec = codeParamForQuestion(question) || specs[0];
     var isCode = function (c) {
-      var s = idx.sources[c.source_id];
+      var s = knowledgeIndex.sources[c.source_id];
       return s && s.kind === "code" && !/tests?[._/]|_test|test_/i.test(c.source_id);
     };
-    var terms = primary ? tokenize([primary.label].concat(primary.aliases || []).join(" ")) : tokenize(question);
-    function score(c) {
+    var terms = namedSpec ? tokenize([namedSpec.label].concat(namedSpec.aliases || []).join(" ")) : tokenize(question);
+    function termDensity(c) {
       var t = c.text.toLowerCase(), s = 0;
       terms.forEach(function (w) { var i = 0, n = 0; while ((i = t.indexOf(w, i)) !== -1) { n++; i += w.length; } s += n; });
       if (/(^|\n)\s*(def|class)\s/.test(c.text)) s += 0.5;
       return s;
     }
     var distinctive = terms.filter(function (w) { return w.length >= 3 && !GENERIC_CODE[w]; });
-    // The parameter as a quoted config key (e.g. cfg.measured_data["batches"]) marks the real usage site,
-    // which a bare-word count misses when the term also names internal variables.
+    // The parameter as a quoted config key marks the real usage site, which a bare-word count misses.
     function configBoost(c) {
       var low = c.text.toLowerCase();
       for (var i = 0; i < distinctive.length; i++) {
@@ -1152,42 +1548,41 @@
     // Pick within a source by base+boost (fixes an overloaded term), but order sources by base.
     function bestIn(chunks) {
       var best = null, bestBoosted = -1, bestBase = -1;
-      chunks.forEach(function (c) { var base = score(c), b = base + configBoost(c); if (b > bestBoosted) { best = c; bestBoosted = b; bestBase = base; } });
+      chunks.forEach(function (c) { var base = termDensity(c), b = base + configBoost(c); if (b > bestBoosted) { best = c; bestBoosted = b; bestBase = base; } });
       return { chunk: best, base: bestBase, boosted: bestBoosted };
     }
-    var sids = primary ? (primary.code_source_ids || []) : [];
+    var sids = namedSpec ? (namedSpec.code_source_ids || []) : [];
     var picked = [];
     sids.forEach(function (sid) {
-      var chunks = idx.chunks.filter(function (c) { return c.source_id === sid && isCode(c); });
+      var chunks = knowledgeIndex.chunks.filter(function (c) { return c.source_id === sid && isCode(c); });
       if (!chunks.length) return;
-      var b = bestIn(chunks);
-      if (b.chunk && b.boosted > 0) picked.push(b);  // only sources where the parameter actually appears
+      var bestForSource = bestIn(chunks);
+      if (bestForSource.chunk && bestForSource.boosted > 0) picked.push(bestForSource);  // only sources where the parameter actually appears
     });
     if (picked.length) {
       picked.sort(function (a, b) { return b.base - a.base; });  // implementation (most param-dense) leads
       return picked.slice(0, 5).map(function (p) { return p.chunk; });
     }
-    var pool = ret.chunks.filter(isCode);  // no curated match: best retrieved code chunk, or nothing
+    var pool = retrieval.chunks.filter(isCode);  // no curated match: best retrieved code chunk, or nothing
     var f = bestIn(pool);
     return f.chunk ? [f.chunk] : [];
   }
 
-  // Single top code chunk (the named parameter's curated code); thin wrapper over findCodeChunks.
-  function findCodeChunk(question, ret) {
-    var arr = findCodeChunks(question, ret);
+  function findCodeChunk(question, retrieval) {
+    var arr = findCodeChunks(question, retrieval);
     return arr.length ? arr[0] : null;
   }
 
   // Show code verbatim: the model rewrites real code (wrong signatures, dropped lines) when asked to quote it.
-  // Renders every curated code site for the parameter, each labelled by its source, then one explanation.
-  function showCodeVerbatim(question, ret, codeChunks) {
-    var primary = codeParamForQuestion(question) || (ret.specs && ret.specs[0]);
-    var terms = primary ? tokenize([primary.label].concat(primary.aliases || []).join(" ")) : tokenize(question);
+  function showCodeVerbatim(question, retrieval, codeChunks) {
+    var namedSpec = codeParamForQuestion(question) || (retrieval.specs && retrieval.specs[0]);
+    var terms = namedSpec ? tokenize([namedSpec.label].concat(namedSpec.aliases || []).join(" ")) : tokenize(question);
     var blocks = codeChunks.map(function (c, i) {
+      // Strips the indexer's breadcrumb line; the same pattern can bite a code line containing ' > '.
       var raw = String(c.text || "").replace(/^[^\n]{1,160} > [^\n]{0,160}\n+/, "").trim();
-      // Full only for a primary that's an actual implementation; a config-read or secondary site is trimmed.
+      // Full text only for a primary that's an actual implementation; a config-read or secondary site is trimmed.
       var code = (i === 0 && !isConfigReadChunk(raw, terms)) ? raw : focusExcerpt(raw, terms);
-      var title = (idx.sources[c.source_id] && idx.sources[c.source_id].title) || c.source_id;
+      var title = (knowledgeIndex.sources[c.source_id] && knowledgeIndex.sources[c.source_id].title) || c.source_id;
       return { title: title, code: code, src: c.source_id };
     });
     var md = blocks.map(function (b) { return "**" + b.title + "**\n\n```python\n" + b.code + "\n```"; }).join("\n\n");
@@ -1203,74 +1598,94 @@
       { role: "user", content: explainUser }
     ]).then(function (expl) {
       activeBot.innerHTML = renderMarkdown(md + "\n\n" + ((expl || "").trim()));
-      renderCitations(activeBot, codeChunks.concat(ret.chunks));
+      renderCitations(activeBot, codeChunks.concat(retrieval.chunks));
       recordTurn(question, "Showed source code from " + srcList + ". " + (expl || "").trim());
       scrollDown();
     }).catch(function () {
       activeBot.innerHTML = renderMarkdown(md);
-      renderCitations(activeBot, codeChunks.concat(ret.chunks));
+      renderCitations(activeBot, codeChunks.concat(retrieval.chunks));
       recordTurn(question, "Showed source code from " + srcList + ".");
       scrollDown();
     });
   }
 
   // Normal answer path: stream, refuse honestly, or ask one CLARIFY question.
-  function answerNormally(question, ret, resolved, allowClarify, valueAnswer) {
+  function answerNormally(question, retrieval, standalone, allowClarify, valueAnswer) {
     var refusalMsg = allowClarify ? INTERACTIVE_NO_EVIDENCE_MESSAGE : INSUFFICIENT_EVIDENCE_MESSAGE;
-    if (!ret.chunks.length) {
+    if (!retrieval.chunks.length) {
       var noEv = allowClarify ? engageWithoutEvidence(question) : Promise.resolve(INSUFFICIENT_EVIDENCE_MESSAGE);
       return noEv.then(function (text) { fillBubble(text); recordTurn(question, text); });
     }
-    if (isCodeRequest(resolved || question)) {
-      var codeChunks = findCodeChunks(resolved || question, ret);
-      if (codeChunks.length) return showCodeVerbatim(question, ret, codeChunks);
+    // Detect and locate code from the condensed question, but explain using the user's literal wording.
+    if (isCodeRequest(standalone || question)) {
+      var codeChunks = findCodeChunks(standalone || question, retrieval);
+      if (codeChunks.length) {
+        return showCodeVerbatim(question, retrieval, codeChunks);
+      }
     }
-    var isFollowup = !!resolved && normQ(resolved) !== normQ(question);
-    var rendered = "";
+    var isFollowup = !!standalone && normalizeQuestion(standalone) !== normalizeQuestion(question);
+    var streamedText = "";
     function isClarify(t) { return allowClarify && /^\s*CLARIFY:/i.test((t || "").trim()); }
-    return streamChat(question, ret, function (full) {
-      rendered = full;
+    return streamChat(question, retrieval, function (full) {
+      streamedText = full;
       if (isClarify(full)) activeBot.innerHTML = renderMarkdown(full.trim().replace(/^\s*CLARIFY:\s*/i, ""));
-      else if (/INSUFFICIENT_EVIDENCE/i.test(full)) activeBot.innerHTML = renderMarkdown(refusalMsg);
+      // The sentinel opens the reply, so this fires on the first chunk; re-decided from the whole text below.
+      else if (isRefusal(full)) activeBot.innerHTML = renderMarkdown(refusalMsg);
       else activeBot.innerHTML = renderMarkdown(full);
       scrollDown();
     }, isFollowup, allowClarify, valueAnswer).then(function () {
       activeBot.classList.remove("gpa-cursor");
-      if (isClarify(rendered)) {
-        var q = rendered.trim().replace(/^\s*CLARIFY:\s*/i, "").trim() || "Could you say a bit more about what you're trying to do?";
-        askClarify(question, q);
+      if (isClarify(streamedText)) {
+        var clarifyQuestion = streamedText.trim().replace(/^\s*CLARIFY:\s*/i, "").trim() || "Could you say a bit more about what you're trying to do?";
+        askClarify(question, clarifyQuestion);
         return;
       }
-      var refused = /INSUFFICIENT_EVIDENCE/i.test(rendered);
-      var answer = refused ? refusalMsg : rendered.trim();
+      var refused = isRefusal(streamedText);
+      var answer = refused ? refusalMsg : streamedText.trim();
       activeBot.innerHTML = renderMarkdown(answer);
-      if (!refused) renderCitations(activeBot, ret.chunks);
+      if (!refused) renderCitations(activeBot, retrieval.chunks);
       recordTurn(question, answer);
       scrollDown();
     });
   }
 
-  // Core turn: retrieve, then answer, clarify, or show code.
+  // Core turn: condense, retrieve, then route to value-clarify, fork-clarify, or answer.
   function corePipeline(question, allowClarify, valueAnswer) {
-    return contextualize(question).then(function (contextual) {
-      var standalone = (normQ(question) !== normQ(contextual)) ? contextual : question;
-      var isFollowup = normQ(standalone) !== normQ(question);
+    return contextualize(question).then(function (condensed) {
+      var standalone = (normalizeQuestion(question) !== normalizeQuestion(condensed)) ? condensed : question;
+      var isFollowup = normalizeQuestion(standalone) !== normalizeQuestion(question);
+      // valueChoiceActive outlives the clarify reply; a question that is not a follow-up ends it.
       if (allowClarify && valueChoiceActive && !isFollowup) valueChoiceActive = false;
-      var continuing = allowClarify && valueChoiceActive && isFollowup;
-      var goalP = (allowClarify && !continuing) ? needsGoal(contextual) : Promise.resolve(false);
-      return Promise.all([retrieve(contextual), goalP]).then(function (r) {
-        var ret = r[0], goal = r[1];
-        if (allowClarify && !continuing) {
-          var fork = termFork(contextual, ret.specs);
-          if (goal) { valueChoiceActive = true; return generateValueClarify(contextual, ret, fork).then(function (q) { askClarify(question, q, true); }); }
-          if (fork.length) { askClarify(question, forkQuestion(fork), false); return; }
+      var continuingValueChoice = allowClarify && valueChoiceActive && isFollowup;
+      var goalCheck = (allowClarify && !continuingValueChoice) ? needsGoal(condensed) : Promise.resolve(false);
+      return Promise.all([retrieve(condensed), goalCheck]).then(function (r) {
+        var retrieval = r[0], mustAskGoal = r[1];
+        var clarifying = allowClarify && !continuingValueChoice;
+        // A term matching a setting is not the question being ABOUT it; may resolve to empty.
+        var forkGate = Promise.resolve([]);
+        if (clarifying) {
+          var seeded = forkCandidates(condensed, retrieval.forkPool);
+          forkGate = forkIsTheSubject(condensed, seeded).then(function (aboutTheSettings) {
+            return (seeded.length && !aboutTheSettings) ? [] : seeded;
+          });
         }
-        return answerNormally(question, ret, standalone, allowClarify && !continuing, valueAnswer);
+        return forkGate.then(function (fork) {
+          if (clarifying && mustAskGoal) {
+            valueChoiceActive = true;
+            // fork rides along: generateValueClarify prepends the fork question, so the reply answers it too.
+            return generateValueClarify(condensed, retrieval, fork).then(function (clarifyQuestion) { askClarify(question, clarifyQuestion, true, fork); });
+          }
+          if (clarifying && fork.length) {
+            askClarify(question, forkQuestion(fork), false, fork);
+            return;
+          }
+          return answerNormally(question, retrieval, standalone, clarifying, valueAnswer);
+        });
       });
     });
   }
 
-  // Route a question through condense, verify, and value-choice before answering.
+  // Verify gate: a contentless 'you sure?' re-checks the last answer; everything else goes to corePipeline.
   function processQuestion(question) {
     if (isVerificationFollowup(question)) {
       return verifyPriorAnswer().then(function (handled) {
@@ -1283,7 +1698,8 @@
 
   // Handle a user submit, or a reply to a pending clarify.
   function ask(question) {
-    if (busy || !connected) return;
+    // indexing blocks the Enter key too, which the disabled button alone would not.
+    if (busy || !connected || indexing) return;
     question = question.trim();
     if (!question && !pendingClarify) return;
     busy = true;
@@ -1307,12 +1723,23 @@
       els.input.focus();
     }
 
+    // A clarify reply is folded into the ORIGINAL question and re-run with clarifying disabled.
     if (pendingClarify) {
       var original = pendingClarify.question;
       var valueChoice = pendingClarify.valueChoice;
+      var fork = pendingClarify.fork;
+      var asked = pendingClarify.asked;
+      var reAsked = pendingClarify.reAsked;
       pendingClarify = null;
       var keep = question && !/^(quit|exit|cancel|stop)$/i.test(question);
-      var folded = keep ? original + " (" + question + ")" : original;
+      var picked = keep ? resolveForkReply(question, fork) : null;
+      // Unreadable reply: re-ask rather than let the ranking pick. Value clarifies reply with a goal, so are exempt.
+      if (keep && !picked && !valueChoice && !reAsked && fork && fork.length >= 2) {
+        askClarify(original, forkReaskQuestion(fork), false, fork, true);
+        done();
+        return;
+      }
+      var folded = keep ? foldClarifyReply(original, question, fork, asked) : original;
       corePipeline(folded, false, valueChoice).catch(fail).then(done);
       return;
     }
@@ -1320,7 +1747,7 @@
     processQuestion(question).catch(fail).then(done);
   }
 
-  // Show a status/setup banner in the message area.
+  // Only one banner lives in the message area at a time -- this drops the previous one.
   function showBanner(html, isError) {
     var existing = els.messages.querySelector(".gpa-banner");
     if (existing) existing.remove();
@@ -1330,7 +1757,7 @@
     return b;
   }
 
-  // One-time Ollama setup instructions banner.
+  // Assembled in JS so the OLLAMA_ORIGINS command shows the visitor's own origin.
   function setupInstructionsHtml() {
     var origin = window.location.origin;
     return "<strong>Connect your local model</strong><br>" +
@@ -1348,15 +1775,15 @@
       "<div class=\"gpa-disclaimer\">Note: needs a Chromium-based browser (Chrome/Edge/Brave). Safari blocks localhost requests from HTTPS pages.</div>";
   }
 
-  // Fill the model dropdown from the installed Ollama models.
   function populateModelSelect() {
     els.modelSelect.innerHTML = "";
-    models.forEach(function (n) {
+    chatModels.forEach(function (n) {
       var o = el("option");
       o.value = n; o.textContent = n;
       els.modelSelect.appendChild(o);
     });
-    chatModel = models.indexOf(DEFAULT_MODEL) !== -1 ? DEFAULT_MODEL : models[0];
+    // Also (re)sets chatModel: DEFAULT_MODEL when installed, else the first listed.
+    chatModel = chatModels.indexOf(DEFAULT_MODEL) !== -1 ? DEFAULT_MODEL : chatModels[0];
     els.modelSelect.value = chatModel;
   }
 
@@ -1368,22 +1795,43 @@
   function warnIfWeakModel() {
     removeWeakBanner();
     if (!connected) return;
+    // Snapshot the model: /api/show is async, so a switch mid-flight discards the result.
     var model = chatModel;
-    modelParamsB(model).then(function (b) {
-      if (b === null || b >= MIN_PARAMS_B || chatModel !== model) return;
+    modelParamsB(model).then(function (paramsB) {
+      if (paramsB === null || paramsB >= MIN_MODEL_PARAMS_B || chatModel !== model) return;
       var w = el("div", "gpa-banner gpa-weakwarn",
-        "<strong>" + escapeHtml(model) + "</strong> has only " + b.toFixed(1) + "B parameters — likely not " +
-        "strong enough for reliable grounded answers. Prefer a " + MIN_PARAMS_B.toFixed(0) + "B+ model (e.g. " + DEFAULT_MODEL + ").");
+        "<strong>" + escapeHtml(model) + "</strong> has only " + paramsB.toFixed(1) + "B parameters — likely not " +
+        "strong enough for reliable grounded answers. Prefer a " + MIN_MODEL_PARAMS_B.toFixed(0) + "B+ model (e.g. " + DEFAULT_MODEL + ").");
       els.messages.appendChild(w);
       scrollDown();
     });
   }
 
+  // Hold the input until the corpus is embedded: questions asked before that retrieve BM25-only and cannot fork.
+  function setIndexing(on) {
+    indexing = on;
+    // Its own class, not showBanner: that one drops any .gpa-banner, including the weak-model warning.
+    var existing = els.messages.querySelector(".gpa-indexing");
+    if (on && !existing) {
+      els.messages.appendChild(el("div", "gpa-banner gpa-indexing",
+        "Indexing documentation… the assistant answers once the search index is built. " +
+        "This runs once — later visits reuse the cached index."));
+      scrollDown();
+    } else if (!on && existing) {
+      existing.remove();
+    }
+    els.input.disabled = on;
+    els.input.placeholder = on ? "Indexing documentation…" : INPUT_PLACEHOLDER;
+    // Never enable Send under a turn already in flight -- ask()'s done() owns the button then.
+    els.send.disabled = on || busy;
+    if (!on) els.input.focus();
+  }
+
   // Connect to Ollama: probe, greet, size-gate, then build vectors.
   function connect() {
     var b = showBanner("Connecting to your local Ollama…", false);
-    return probeOllama().then(function (res) {
-      if (!res.ok) {
+    return probeOllama().then(function (probeResult) {
+      if (!probeResult.ok) {
         connected = false;
         setStatus("off");
         var banner = showBanner(setupInstructionsHtml(), true);
@@ -1391,21 +1839,21 @@
         if (retry) retry.addEventListener("click", connect);
         return;
       }
-      if (!res.models.length) {
+      if (!probeResult.models.length) {
         connected = false;
         setStatus("off");
-        var bb = showBanner("Ollama is running but has no chat models. Pull one:" +
+        var noModelsBanner = showBanner("Ollama is running but has no chat models. Pull one:" +
           "<code>ollama pull " + DEFAULT_MODEL + "</code>" +
           "<button class=\"gpa-btn gpa-secondary\" id=\"gpa-retry\">Retry</button>", true);
-        var r2 = bb.querySelector("#gpa-retry");
-        if (r2) r2.addEventListener("click", connect);
+        var noModelsRetry = noModelsBanner.querySelector("#gpa-retry");
+        if (noModelsRetry) noModelsRetry.addEventListener("click", connect);
         return;
       }
       connected = true;
       setStatus("ok");
       populateModelSelect();
-      var ex = els.messages.querySelector(".gpa-banner");
-      if (ex) ex.remove();
+      var staleBanner = els.messages.querySelector(".gpa-banner");
+      if (staleBanner) staleBanner.remove();
       els.footer.style.display = "block";
       if (!els.messages.querySelector(".gpa-msg")) {
         var hint = el("div", "gpa-msg gpa-bot",
@@ -1414,24 +1862,26 @@
           "</strong> on your machine.");
         els.messages.appendChild(hint);
       }
-      els.input.focus();
       warnIfWeakModel();
 
+      // Embeddings are optional: leaving these three null is the deliberate downgrade to BM25-only.
       embedModel = pickEmbedModel(embedModels);
       chunkVectors = null;
       paramRows = null;
-      if (!embedModel) return;
+      // No embedding model installed: BM25-only is the permanent, documented mode -- nothing to wait for.
+      if (!embedModel) { els.input.focus(); return; }
+      setIndexing(true);
       return buildChunkVectors().then(function () {
         return buildParamVectors();
       }).catch(function () {
         embedModel = null;
         chunkVectors = null;
         paramRows = null;
-      });
+      // Runs on both paths: a failed build degrades to BM25-only for good, so holding the input longer buys nothing.
+      }).then(function () { setIndexing(false); });
     });
   }
 
-  // Build the widget DOM and wire up its events.
   function buildPanel() {
     var panel = el("div");
     panel.id = "gpa-panel";
@@ -1447,7 +1897,7 @@
         '<div class="gpa-modelrow"><span>Model:</span>' +
           '<select id="gpa-model"></select></div>' +
         '<div class="gpa-inputrow">' +
-          '<textarea id="gpa-input" rows="1" placeholder="Ask about GEM-pRF…"></textarea>' +
+          '<textarea id="gpa-input" rows="1" placeholder="' + INPUT_PLACEHOLDER + '"></textarea>' +
           '<button class="gpa-btn" id="gpa-send">Send</button>' +
         '</div>' +
       '</div>';
@@ -1481,29 +1931,28 @@
     });
   }
 
-  var opened = false;
+  var bootstrapped = false;
   // Open the panel; load the index and connect on first open.
   function openPanel() {
     els.panel.classList.add("gpa-open");
     els.launcher.classList.add("gpa-hidden");
-    if (!opened) {
-      opened = true;
+    if (!bootstrapped) {
+      bootstrapped = true;
       ensureIndex().then(connect);
     }
   }
-  // Close the panel.
   function closePanel() {
     els.panel.classList.remove("gpa-open");
     els.launcher.classList.remove("gpa-hidden");
   }
 
   var indexPromise = null;
-  // Fetch and prepare the knowledge index once.
+  // The promise memoizes rejection too: a failed index load stays failed for the page's lifetime.
   function ensureIndex() {
     if (indexPromise) return indexPromise;
     indexPromise = fetch(INDEX_URL, { cache: "no-cache" }).then(function (r) { return r.json(); }).then(function (j) {
-      idx = j;
-      bm25 = prepareBm25(idx.chunks);
+      knowledgeIndex = j;
+      bm25 = prepareBm25(knowledgeIndex.chunks);
     }).catch(function (e) {
       showBanner("Failed to load the knowledge index: " + (e.message || e), true);
       throw e;
@@ -1511,6 +1960,7 @@
     return indexPromise;
   }
 
+  // Nothing is fetched or probed until the first open.
   if (typeof document !== "undefined") {
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", buildPanel);
@@ -1519,28 +1969,35 @@
     }
   }
 
+  // Node/test surface. These KEY names are the external contract; the functions behind them may be renamed.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
+      headTerms: headOwners,
       tokenize: tokenize, renderMarkdown: renderMarkdown,
-      matchParametersEmbedding: matchParametersEmbedding, matchParametersSubstring: matchParametersSubstring,
+      // Key renamed with the return shape ([spec] -> {named, partial}), so a stale consumer fails loudly.
+      matchParametersEmbedding: matchParametersEmbedding, matchParametersByName: matchParametersByName,
       buildParamVectors: buildParamVectors, retrieve: retrieve, buildHumanPrompt: buildHumanPrompt,
-      termFork: termFork, forkQuestion: forkQuestion, CLARIFY_DIRECTIVE: CLARIFY_DIRECTIVE,
+      evidenceClass: evidenceClass, hasProseEvidence: hasProseEvidence,
+      termFork: forkCandidates, forkQuestion: forkQuestion, forkIsTheSubject: forkIsTheSubject, CLARIFY_DIRECTIVE: CLARIFY_DIRECTIVE,
+      resolveForkReply: resolveForkReply, foldClarifyReply: foldClarifyReply, forkReaskQuestion: forkReaskQuestion,
       isCodeRequest: isCodeRequest, codeParamForQuestion: codeParamForQuestion, findCodeChunk: findCodeChunk, findCodeChunks: findCodeChunks,
-      namesParameter: namesParameter, valueClarifyingQuestion: valueClarifyingQuestion,
+      namesParameter: namesParameter, valueClarifyingQuestion: valueClarifyFallback,
       needsGoal: needsGoal, engageWithoutEvidence: engageWithoutEvidence,
       INTERACTIVE_NO_EVIDENCE_MESSAGE: INTERACTIVE_NO_EVIDENCE_MESSAGE,
       streamChat: streamChat, SYSTEM_PROMPT: SYSTEM_PROMPT,
-      INSUFFICIENT_EVIDENCE_MESSAGE: INSUFFICIENT_EVIDENCE_MESSAGE,
+      INSUFFICIENT_EVIDENCE_MESSAGE: INSUFFICIENT_EVIDENCE_MESSAGE, isRefusal: isRefusal,
+      VALUE_ANSWER_DIRECTIVE: VALUE_ANSWER_DIRECTIVE, GOAL_TRIAD: GOAL_TRIAD,
       contextualize: contextualize, chatComplete: chatComplete,
       isVerificationFollowup: isVerificationFollowup, verifyPriorAnswer: verifyPriorAnswer,
       adjudicateConsistency: adjudicateConsistency, composeVerify: composeVerify, firstSentence: firstSentence,
-      analyzeFold: analyzeFold, generateAnswer: generateAnswer,
+      analyzeFold: retrieveAndAnswer, generateAnswer: generateAnswer,
       _setHistory: function (h) { history = h; },
       pickEmbedModel: pickEmbedModel, buildChunkVectors: buildChunkVectors, ollamaEmbed: ollamaEmbed,
-      _load: function (j) { idx = j; bm25 = prepareBm25(idx.chunks); _tokenOwnersCache = null; _anchorVocabCache = null; },
+      // A test swapping the index must clear these three caches.
+      _load: function (j) { knowledgeIndex = j; bm25 = prepareBm25(knowledgeIndex.chunks); _tokenOwnersCache = null; _anchorVocabCache = null; _headOwnersCache = null; },
       _setModel: function (m) { chatModel = m; },
       _setEmbedModel: function (m) { embedModel = m; },
-      _state: function () { return { embedModel: embedModel, haveVectors: !!chunkVectors, chunks: idx.chunks.length }; }
+      _state: function () { return { embedModel: embedModel, haveVectors: !!chunkVectors, chunks: knowledgeIndex.chunks.length }; }
     };
   }
 })();

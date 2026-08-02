@@ -1,7 +1,7 @@
 (function loadAssistant() {
   if (document.getElementById("gpa-assistant-css")) return;
   if (document.getElementById("ai-assistant-btn")) return;
-  var v = "?v=7";  // cache-bust: bump whenever assistant.css/js change so visitors get the update, not a stale copy
+  var v = "?v=21";  // cache
   const link = document.createElement("link");
   link.id = "gpa-assistant-css";
   link.rel = "stylesheet";
@@ -74,9 +74,7 @@ document.addEventListener("DOMContentLoaded", () => {
             wrapper.appendChild(link);
             h2.appendChild(wrapper);
 
-            // After the elements are in the DOM, size the inner container to match the title width
-            // so the image (100% width of inner) and title remain centered together while the
-            // wrapper (full-width) stays left-aligned with other sidebar items.
+            // Size the inner container to the title width so image and title stay centered in the left-aligned wrapper.
             requestAnimationFrame(() => {
               try {
                 const titleWidth = titleDiv.getBoundingClientRect().width;

@@ -145,6 +145,20 @@
   border-radius: 10px; padding: 10px 12px;
 }
 .gpa-banner.gpa-error { background: #fdecea; border-color: #f5c6c0; color: #8a2820; }
+/* Progress, not a warning: the amber banner reads as something being wrong, and nothing is. */
+.gpa-banner.gpa-indexing {
+  background: var(--gpa-panel-bg); border-color: var(--gpa-border); color: var(--gpa-muted);
+  display: flex; align-items: center; gap: 9px;
+}
+.gpa-banner.gpa-indexing::before {
+  content: ""; flex: none; width: 13px; height: 13px; border-radius: 50%;
+  border: 2px solid var(--gpa-border); border-top-color: var(--gpa-accent);
+  animation: gpa-spin 0.8s linear infinite;
+}
+@keyframes gpa-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .gpa-banner.gpa-indexing::before { animation-duration: 2.4s; }
+}
 .gpa-banner code {
   display: block; background: #23303a; color: #e6edf3;
   padding: 6px 8px; border-radius: 6px; margin: 6px 0; font-size: 12px;
@@ -188,3 +202,4 @@
 @media (max-width: 480px) {
   #gpa-panel { right: 8px; bottom: 8px; height: calc(100vh - 16px); }
 }
+
