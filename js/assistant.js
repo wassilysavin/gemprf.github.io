@@ -911,6 +911,20 @@
   // Per-source cap: at TOP_K 6, a cap of 3 let one source hold half the evidence. See tests/RETRIEVAL.md.
   var MAX_PER_SOURCE = 2;
 
+  // How many top cosines the abstain gate averages, and the query length below which it stands down.
+  var ABSTAIN_SAMPLE = 5;
+  var ABSTAIN_MIN_TERMS = 2;
+
+  // Mean of the n best scores. Reads the neighbourhood around the top hit, not the hit alone.
+  function meanTopN(scores, n) {
+    var sorted = scores.slice().sort(function (a, b) { return b - a; });
+    var take = Math.min(n, sorted.length);
+    if (!take) return 0;
+    var sum = 0;
+    for (var i = 0; i < take; i++) sum += sorted[i];
+    return sum / take;
+  }
+
   // Embed the question, or say why not: 'unconfigured' (nothing to score against) vs 'embed-failed'.
   function embedQuery(question) {
     if (!embedModel || (!chunkVectors && !paramRows)) return Promise.resolve({ vec: null, degraded: "unconfigured" });
@@ -977,7 +991,9 @@
     return {
       bm25Scores: cappedExpansionScores(w),
       semScores: (qVec && chunkVectors) ? chunkVectors.map(function (cv) { return dot(qVec, cv); }) : null,
-      expansion: w.words
+      expansion: w.words,
+      // Own terms only: expansion would inflate every query past the gate's single-term exemption.
+      ownTerms: Object.keys(w.own).length
     };
   }
 
@@ -1000,9 +1016,13 @@
     // Maxima must be read before blendScores: min-max maps the best cosine to 1.0, erasing magnitude.
     var maxCos = evidence.semScores ? Math.max.apply(null, evidence.semScores) : 0;
     var maxBm25 = evidence.bm25Scores.length ? Math.max.apply(null, evidence.bm25Scores) : 0;
-    // Abstain only when BOTH signals are silent; the gate needs cosine, so it never fires in bm25 mode.
-    if (evidence.semScores && maxCos < evidenceFloor() && maxBm25 <= 0) {
-      return { chunks: [], maxCos: maxCos, maxBm25: maxBm25, empty: true };
+    // A stray chunk clears the floor off-topic (sky peaks at 0.62); real coverage lifts its neighbours too.
+    var topCos = evidence.semScores ? meanTopN(evidence.semScores, ABSTAIN_SAMPLE) : 0;
+    // One-term lookups (nDCT, sigmaMajor) hit hard but drag no neighbours, so BM25 rescues them instead.
+    var noNeighbourhood = topCos < evidenceFloor() && evidence.ownTerms >= ABSTAIN_MIN_TERMS;
+    // The gate needs cosine, so it still never fires in bm25 mode.
+    if (evidence.semScores && (noNeighbourhood || maxBm25 <= 0)) {
+      return { chunks: [], maxCos: maxCos, maxBm25: maxBm25, topCos: topCos, empty: true };
     }
     var blended = blendScores(evidence.bm25Scores, evidence.semScores);
     var ranked = [];
@@ -1010,7 +1030,7 @@
       if (blended[i] > 0) ranked.push({ chunkIndex: i, score: blended[i] });
     }
     ranked.sort(function (a, b) { return b.score - a.score; });
-    return { chunks: diverseTopK(ranked, TOP_K, MAX_PER_SOURCE), maxCos: maxCos, maxBm25: maxBm25, empty: false };
+    return { chunks: diverseTopK(ranked, TOP_K, MAX_PER_SOURCE), maxCos: maxCos, maxBm25: maxBm25, topCos: topCos, empty: false };
   }
 
   // The only place the record is built, so the gated-empty shape cannot drift from the full one.
@@ -1025,7 +1045,7 @@
       expansion: gated ? [] : evidence.expansion,
       mode: evidence.semScores ? "hybrid" : "bm25",
       degraded: q.degraded,
-      maxCos: picked.maxCos, maxBm25: picked.maxBm25
+      maxCos: picked.maxCos, maxBm25: picked.maxBm25, topCos: picked.topCos
     };
   }
 
