@@ -879,18 +879,29 @@
   }
 
   // Per-model cosine floor from the index: each model sits on its own band (nomic off-topic ~0.52, not ~0).
-  function modelFloor(tableName, fallback) {
+  function modelFloorEntry(tableName) {
     var table = (knowledgeIndex && knowledgeIndex.meta && knowledgeIndex.meta[tableName]) || null;
-    if (!table) return fallback;
+    if (!table) return null;
     var m = (embedModel || "").toLowerCase();
     var key = Object.keys(table).filter(function (k) { return k !== "default" && m.indexOf(k) !== -1; })[0];
-    if (key && typeof table[key] === "number") return table[key];
-    return typeof table["default"] === "number" ? table["default"] : fallback;
+    if (key && typeof table[key] === "number") return { value: table[key], calibrated: true };
+    return typeof table["default"] === "number" ? { value: table["default"], calibrated: false } : null;
+  }
+
+  function modelFloor(tableName, fallback) {
+    var entry = modelFloorEntry(tableName);
+    return entry ? entry.value : fallback;
   }
 
   // Below this the corpus holds no evidence; the fallback sits low so an unmeasured model under-refuses.
   var DEFAULT_EVIDENCE_FLOOR = 0.55;
   function evidenceFloor() { return modelFloor("evidence_floor", DEFAULT_EVIDENCE_FLOOR); }
+
+  // True only when meta ships a floor measured for THIS model; the 'default' entry is not a measurement.
+  function evidenceFloorCalibrated() {
+    var entry = modelFloorEntry("evidence_floor");
+    return !!(entry && entry.calibrated);
+  }
 
   // Below this, the question is judged to name no parameter -- see matchParametersEmbedding.
   function parameterFloor() { return modelFloor("parameter_floor", DEFAULT_PARAMETER_FLOOR); }
@@ -911,9 +922,8 @@
   // Per-source cap: at TOP_K 6, a cap of 3 let one source hold half the evidence. See tests/RETRIEVAL.md.
   var MAX_PER_SOURCE = 2;
 
-  // How many top cosines the abstain gate averages, and the query length below which it stands down.
+  // How many top cosines the abstain gate averages; the single-term exemption lives in selectChunks.
   var ABSTAIN_SAMPLE = 5;
-  var ABSTAIN_MIN_TERMS = 2;
 
   // Mean of the n best scores. Reads the neighbourhood around the top hit, not the hit alone.
   function meanTopN(scores, n) {
@@ -1019,9 +1029,15 @@
     // A stray chunk clears the floor off-topic (sky peaks at 0.62); real coverage lifts its neighbours too.
     var topCos = evidence.semScores ? meanTopN(evidence.semScores, ABSTAIN_SAMPLE) : 0;
     // One-term lookups (nDCT, sigmaMajor) hit hard but drag no neighbours, so BM25 rescues them instead.
-    var noNeighbourhood = topCos < evidenceFloor() && evidence.ownTerms >= ABSTAIN_MIN_TERMS;
+    var noNeighbourhood = topCos < evidenceFloor() && evidence.ownTerms !== 1;
+    // BM25 zero is only evidence of absence when the user typed content terms; 'What is GEM-pRF?' has none.
+    var noLexicalMatch = maxBm25 <= 0 && evidence.ownTerms > 0;
+    // An unmeasured model's band is unknown: it keeps the conjunctive max form, under-refusing as the fallback intends.
+    var gated = evidenceFloorCalibrated()
+      ? (noNeighbourhood || noLexicalMatch)
+      : (maxCos < evidenceFloor() && maxBm25 <= 0);
     // The gate needs cosine, so it still never fires in bm25 mode.
-    if (evidence.semScores && (noNeighbourhood || maxBm25 <= 0)) {
+    if (evidence.semScores && gated) {
       return { chunks: [], maxCos: maxCos, maxBm25: maxBm25, topCos: topCos, empty: true };
     }
     var blended = blendScores(evidence.bm25Scores, evidence.semScores);
