@@ -1003,7 +1003,9 @@
       semScores: (qVec && chunkVectors) ? chunkVectors.map(function (cv) { return dot(qVec, cv); }) : null,
       expansion: w.words,
       // Own terms only: expansion would inflate every query past the gate's single-term exemption.
-      ownTerms: Object.keys(w.own).length
+      ownTerms: Object.keys(w.own).length,
+      // Lexical anchor to the catalog ('nDCT value'): the abstain gate lets BM25 net these, not the mean.
+      namesParam: namesParameter(question)
     };
   }
 
@@ -1028,10 +1030,10 @@
     var maxBm25 = evidence.bm25Scores.length ? Math.max.apply(null, evidence.bm25Scores) : 0;
     // A stray chunk clears the floor off-topic (sky peaks at 0.62); real coverage lifts its neighbours too.
     var topCos = evidence.semScores ? meanTopN(evidence.semScores, ABSTAIN_SAMPLE) : 0;
-    // One-term lookups (nDCT, sigmaMajor) hit hard but drag no neighbours, so BM25 rescues them instead.
-    var noNeighbourhood = topCos < evidenceFloor() && evidence.ownTerms !== 1;
-    // BM25 zero is only evidence of absence when the user typed content terms; 'What is GEM-pRF?' has none.
-    var noLexicalMatch = maxBm25 <= 0 && evidence.ownTerms > 0;
+    // One-term and catalog-name lookups ('nDCT value') hit hard but drag no neighbours; BM25 nets them instead.
+    var noNeighbourhood = topCos < evidenceFloor() && evidence.ownTerms !== 1 && !evidence.namesParam;
+    // Alien vocabulary refuses only when typed terms exist AND the embedder lands nowhere -- 'binarisation' cosines in.
+    var noLexicalMatch = maxBm25 <= 0 && evidence.ownTerms > 0 && maxCos < evidenceFloor();
     // An unmeasured model's band is unknown: it keeps the conjunctive max form, under-refusing as the fallback intends.
     var gated = evidenceFloorCalibrated()
       ? (noNeighbourhood || noLexicalMatch)
