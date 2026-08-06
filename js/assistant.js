@@ -16,7 +16,7 @@
   var HISTORY_ANSWER_CHAR_CAP = 500;
   // Restored by setIndexing, so it lives here rather than inline in the panel markup alone.
   var INPUT_PLACEHOLDER = "Ask about GEM-pRF…";
-  // chatComplete only -- the stream path never retries. STREAM_IDLE_MS is a per-chunk gap, not a deadline.
+  // chatComplete only -- the stream path never retries. STREAM_IDLE_MS gaps chunks after a first LLM_TIMEOUT_MS window.
   var LLM_TIMEOUT_MS = 180000;
   var LLM_RETRIES = 3;
   var STREAM_IDLE_MS = 90000;
@@ -585,13 +585,21 @@
   // No edits under 5 chars, where one edit reaches a different word ('grid'/'grip').
   function editBudget(word) { return word.length >= 8 ? 2 : word.length >= 5 ? 1 : 0; }
 
-  // A reply word matches a surface word outright or by a spelling slip -- 'spetial' is 'spatial'.
-  function replySays(replyWords, surfaceWord) {
+  // Index of the reply word matching a surface word outright or by a spelling slip ('spetial' is 'spatial'); -1 when none.
+  function replySaysAt(replyWords, surfaceWord) {
     var budget = editBudget(surfaceWord);
     for (var i = 0; i < replyWords.length; i++) {
-      if (replyWords[i] === surfaceWord) return true;
-      if (budget && withinEdits(replyWords[i], surfaceWord, budget)) return true;
+      if (replyWords[i] === surfaceWord) return i;
+      if (budget && withinEdits(replyWords[i], surfaceWord, budget)) return i;
     }
+    return -1;
+  }
+
+  function replySays(replyWords, surfaceWord) { return replySaysAt(replyWords, surfaceWord) !== -1; }
+
+  // True when 'not' sits within two words before words[idx] ('not the stimulus one'); 'not sure, maybe stimulus' is too far.
+  function negatedAt(words, idx) {
+    for (var i = Math.max(0, idx - 2); i < idx; i++) { if (words[i] === "not") return true; }
     return false;
   }
 
@@ -604,7 +612,11 @@
   function resolveForkOrdinal(reply, fork) {
     var words = nameWords(reply), idx = null;
     for (var i = 0; i < words.length && idx === null; i++) {
-      if (ORDINAL_WORDS[words[i]] !== undefined) idx = ORDINAL_WORDS[words[i]];
+      if (ORDINAL_WORDS[words[i]] !== undefined) {
+        // 'not the first one' rejects fork[0]: a pair inverts to the other, a longer menu falls through to re-ask.
+        if (negatedAt(words, i)) return (fork.length === 2 && ORDINAL_WORDS[words[i]] < 2) ? fork[1 - ORDINAL_WORDS[words[i]]] : null;
+        idx = ORDINAL_WORDS[words[i]];
+      }
     }
     // A bare number only: '2' alone is a choice, but the 2 in 'about 2 degrees' is a value.
     if (idx === null && /^\s*[1-9]\s*$/.test(reply)) idx = parseInt(reply, 10) - 1;
@@ -621,13 +633,24 @@
     var surfaces = fork.map(surfaceWords);
     // A word every candidate answers to cannot discriminate -- 'radius' is both a grid label and a stimulus alias.
     var discriminates = function (w) { return !surfaces.every(function (s) { return s[w]; }); };
-    var best = null, bestScore = 0, tied = false;
+    var best = null, bestScore = 0, tied = false, rejected = [];
     surfaces.forEach(function (surf, i) {
-      var score = Object.keys(surf).filter(function (w) { return discriminates(w) && replySays(replyWords, w); }).length;
-      if (score > bestScore) { bestScore = score; best = fork[i]; tied = false; }
-      else if (score === bestScore && score > 0) tied = true;
+      var named = 0, negated = 0;
+      Object.keys(surf).forEach(function (w) {
+        if (!discriminates(w)) return;
+        var at = replySaysAt(replyWords, w);
+        if (at < 0) return;
+        if (negatedAt(replyWords, at)) negated++; else named++;
+      });
+      // A candidate only ever mentioned under negation is a rejection, not a pick.
+      if (negated > 0 && named === 0) rejected.push(i);
+      if (named > bestScore) { bestScore = named; best = fork[i]; tied = false; }
+      else if (named === bestScore && named > 0) tied = true;
     });
-    return (best && !tied) ? best : null;
+    if (best && !tied) return best;
+    // 'not the stimulus one' on a pair picks the other; a longer menu re-asks instead of guessing.
+    if (bestScore === 0 && rejected.length === 1 && fork.length === 2) return fork[1 - rejected[0]];
+    return null;
   }
 
   // Fold the reply in as a correction naming the pick, not as an appended annotation.
@@ -1221,11 +1244,17 @@
       body: JSON.stringify({ model: chatModel, messages: messages, stream: false, think: false, options: { temperature: 0 } }),
       signal: abortAfter(LLM_TIMEOUT_MS).signal
     }).then(function (r) {
-      if (!r.ok) throw new Error("Ollama HTTP " + r.status);
+      if (!r.ok) {
+        var httpError = new Error("Ollama HTTP " + r.status);
+        httpError.status = r.status;
+        throw httpError;
+      }
       return r.json();
     }).then(function (j) { return (j.message && j.message.content ? j.message.content : "").trim(); })
       .catch(function (e) {
-        if (attempt < LLM_RETRIES - 1) return delay(1500 * (attempt + 1)).then(function () { return chatComplete(messages, attempt + 1); });
+        // 4xx is permanent (model removed) and an abort already spent the full timeout: retrying either just multiplies the wait.
+        var permanent = !!e && ((e.status >= 400 && e.status < 500) || e.name === "AbortError");
+        if (!permanent && attempt < LLM_RETRIES - 1) return delay(1500 * (attempt + 1)).then(function () { return chatComplete(messages, attempt + 1); });
         throw e;
       });
   }
@@ -1277,9 +1306,10 @@
     // Idle timeout re-armed per chunk: kill a stalled stream, never a slow-but-advancing CPU one.
     var ctl = new AbortController();
     var idle;
-    function arm() { idle = setTimeout(function () { ctl.abort(); }, STREAM_IDLE_MS); }
+    function arm(ms) { idle = setTimeout(function () { ctl.abort(); }, ms); }
     function disarm() { clearTimeout(idle); }
-    arm();
+    // No bytes flow during connect, model load and prompt eval, so the first window gets the full LLM budget.
+    arm(LLM_TIMEOUT_MS);
     return fetch(OLLAMA + "/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1308,11 +1338,16 @@
               onPartial(full);
             }
           }
-          arm();
+          arm(STREAM_IDLE_MS);
           return pump();
         });
       }
-      return pump();
+      // A stall mid-answer surrenders what already streamed rather than wiping it with an error.
+      return pump().catch(function (e) {
+        disarm();
+        if (full) return full + " …";
+        throw e;
+      });
     });
   }
 
@@ -1663,10 +1698,12 @@
     }
     var isFollowup = !!standalone && normalizeQuestion(standalone) !== normalizeQuestion(question);
     var streamedText = "";
-    function isClarify(t) { return allowClarify && /^\s*CLARIFY:/i.test((t || "").trim()); }
+    // Anchored like isRefusal, surviving a leading quote or ** -- models wrap this sentinel the same way.
+    function isClarify(t) { return allowClarify && /^["'`*\s]*CLARIFY:/i.test((t || "").trim()); }
+    function clarifyText(t) { return (t || "").trim().replace(/^["'`*\s]*CLARIFY:\s*/i, "").replace(/["'`*\s]+$/, "").trim(); }
     return streamChat(question, retrieval, function (full) {
       streamedText = full;
-      if (isClarify(full)) activeBot.innerHTML = renderMarkdown(full.trim().replace(/^\s*CLARIFY:\s*/i, ""));
+      if (isClarify(full)) activeBot.innerHTML = renderMarkdown(clarifyText(full));
       // The sentinel opens the reply, so this fires on the first chunk; re-decided from the whole text below.
       else if (isRefusal(full)) activeBot.innerHTML = renderMarkdown(refusalMsg);
       else activeBot.innerHTML = renderMarkdown(full);
@@ -1674,7 +1711,7 @@
     }, isFollowup, allowClarify, valueAnswer).then(function () {
       activeBot.classList.remove("gpa-cursor");
       if (isClarify(streamedText)) {
-        var clarifyQuestion = streamedText.trim().replace(/^\s*CLARIFY:\s*/i, "").trim() || "Could you say a bit more about what you're trying to do?";
+        var clarifyQuestion = clarifyText(streamedText) || "Could you say a bit more about what you're trying to do?";
         askClarify(question, clarifyQuestion);
         return;
       }
@@ -1770,6 +1807,8 @@
       var reAsked = pendingClarify.reAsked;
       pendingClarify = null;
       var keep = question && !/^(quit|exit|cancel|stop)$/i.test(question);
+      // A cancelled or blank reply gave no goal, so the value directive's given-goal premise must not run.
+      if (!keep) valueChoiceActive = false;
       var picked = keep ? resolveForkReply(question, fork) : null;
       // Unreadable reply: re-ask rather than let the ranking pick. Value clarifies reply with a goal, so are exempt.
       if (keep && !picked && !valueChoice && !reAsked && fork && fork.length >= 2) {
@@ -1778,7 +1817,7 @@
         return;
       }
       var folded = keep ? foldClarifyReply(original, question, fork, asked) : original;
-      corePipeline(folded, false, valueChoice).catch(fail).then(done);
+      corePipeline(folded, false, keep && valueChoice).catch(fail).then(done);
       return;
     }
 
