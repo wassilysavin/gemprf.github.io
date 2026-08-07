@@ -1843,7 +1843,7 @@
       "<br>1. Install <a href=\"https://ollama.com/download\" target=\"_blank\" rel=\"noopener\">Ollama</a> " +
       "and pull the model:" +
       "<code>ollama pull " + DEFAULT_MODEL + "</code>" +
-      "2. (Optional, better retrieval) pull an embedding model for semantic search:" +
+      "2. Pull the embedding model (required for retrieval):" +
       "<code>ollama pull " + PREFERRED_EMBED + "</code>" +
       "3. Allow this site to reach Ollama, then restart it:" +
       "<code>launchctl setenv OLLAMA_ORIGINS \"" + origin + "\"   # macOS\n" +
@@ -1926,6 +1926,20 @@
         if (noModelsRetry) noModelsRetry.addEventListener("click", connect);
         return;
       }
+      // An embedding model is as mandatory as a chat model: no BM25-only fallback exists any more.
+      embedModel = pickEmbedModel(embedModels);
+      chunkVectors = null;
+      paramRows = null;
+      if (!embedModel) {
+        connected = false;
+        setStatus("off");
+        var noEmbedBanner = showBanner("Ollama is running but has no embedding model, which retrieval requires. Pull one:" +
+          "<code>ollama pull " + PREFERRED_EMBED + "</code>" +
+          "<button class=\"gpa-btn gpa-secondary\" id=\"gpa-retry\">Retry</button>", true);
+        var noEmbedRetry = noEmbedBanner.querySelector("#gpa-retry");
+        if (noEmbedRetry) noEmbedRetry.addEventListener("click", connect);
+        return;
+      }
       connected = true;
       setStatus("ok");
       populateModelSelect();
@@ -1941,21 +1955,28 @@
       }
       warnIfWeakModel();
 
-      // Embeddings are optional: leaving these three null is the deliberate downgrade to BM25-only.
-      embedModel = pickEmbedModel(embedModels);
-      chunkVectors = null;
-      paramRows = null;
-      // No embedding model installed: BM25-only is the permanent, documented mode -- nothing to wait for.
-      if (!embedModel) { els.input.focus(); return; }
       setIndexing(true);
       return buildChunkVectors().then(function () {
-        return buildParamVectors();
-      }).catch(function () {
+        // buildParamVectors resolves false rather than rejecting; folding that in keeps the gate airtight.
+        return buildParamVectors().then(function (ok) { if (!ok) throw new Error("param embed failed"); });
+      }).then(function () {
+        setIndexing(false);
+      }, function () {
+        // A failed build gates the assistant again rather than degrading: retrieval must not run without vectors.
+        setIndexing(false);
+        var failedModel = embedModel;
         embedModel = null;
         chunkVectors = null;
         paramRows = null;
-      // Runs on both paths: a failed build degrades to BM25-only for good, so holding the input longer buys nothing.
-      }).then(function () { setIndexing(false); });
+        connected = false;
+        setStatus("off");
+        els.footer.style.display = "none";
+        var failedBanner = showBanner("Building the retrieval index with <strong>" + escapeHtml(failedModel) +
+          "</strong> failed. Make sure it is installed and can serve /api/embed, then retry." +
+          "<button class=\"gpa-btn gpa-secondary\" id=\"gpa-retry\">Retry</button>", true);
+        var failedRetry = failedBanner.querySelector("#gpa-retry");
+        if (failedRetry) failedRetry.addEventListener("click", connect);
+      });
     });
   }
 
