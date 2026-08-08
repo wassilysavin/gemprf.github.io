@@ -262,7 +262,13 @@
     "question explicitly refers to it (a new topic in the latest question overrides a prior answer's " +
     "subject). Name the referent the way the USER named it -- the setting's own name, never a code " +
     "variable, formula term, or field name the assistant's answer used for it (fold in 'Batches', not " +
-    "'batch_size'). Do not answer it, do not add new topics -- output only the rewritten question.";
+    "'batch_size'). A latest message that CORRECTS or NARROWS the previous question rather than asking " +
+    "a new one ('i mean nDCT', 'no, the other setting') rewrites the PREVIOUS question with the " +
+    "correction applied, keeping that question's form -- a correction after 'show the code where it is " +
+    "used' still asks to show code. When the referent turn asked about MORE than one setting and the " +
+    "reference does not single one out, keep ALL of those settings in the rewrite -- 'show the code " +
+    "where its used' after a question about two settings asks about both of them, so name both. " +
+    "Do not answer it, do not add new topics -- output only the rewritten question.";
 
   var STOPWORDS = new Set(("a an the of to in on for and or is are was were be been being do does did " +
     "how what which when where why who whom this that these those it its as at by with from into " +
