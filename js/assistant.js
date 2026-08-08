@@ -5,6 +5,8 @@
   var DEFAULT_MODEL = "qwen3:14b";
   var PREFERRED_EMBED = "nomic-embed-text";
   var INDEX_URL = "/assistant_index.json";
+  // Corpus vectors precomputed at build time (tools/build_assistant_vectors.js); saves the first-visit embed wait.
+  var VECTORS_URL = "/assistant_vectors.json";
   var MIN_MODEL_PARAMS_B = 4.0;
   var TOP_K = 6;
   var HISTORY_TURNS = 10;
@@ -266,6 +268,8 @@
   var bm25 = null;
   var chatModels = [];
   var embedModels = [];
+  // Installed-model name -> Ollama manifest digest; gates whether shipped corpus vectors are trustworthy.
+  var modelDigests = {};
   var chatModel = DEFAULT_MODEL;
   var embedModel = null;
   var chunkVectors = null;
@@ -859,19 +863,57 @@
     return available[0];
   }
 
-  // Embed the corpus chunks once, cached by (corpus_sha, model).
+  // Old-corpus/old-model blobs are never read again; left behind they eat the quota until setItem fails silently.
+  function purgeStaleVectors(prefix, keep) {
+    var stale = [];
+    try {
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (k && k.indexOf(prefix) === 0 && k !== keep) stale.push(k);
+      }
+      stale.forEach(function (k) { localStorage.removeItem(k); });
+    } catch (e) {  }
+  }
+
+  var vectorsFilePromise = null;
+  function fetchVectorsFile() {
+    if (!vectorsFilePromise) {
+      vectorsFilePromise = fetch(VECTORS_URL, { cache: "no-cache" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; });
+    }
+    return vectorsFilePromise;
+  }
+
+  // Query vectors come from the visitor's model, so shipped doc vectors need that exact model: same digest, same corpus.
+  function usablePrecomputed(p) {
+    return p && p.corpus_sha === knowledgeIndex.meta.corpus_sha &&
+      p.model && embedModel && embedModel.toLowerCase().indexOf(p.model) !== -1 &&
+      p.digest && modelDigests[embedModel] === p.digest ? p : null;
+  }
+
+  function saveVectors(cacheKey, vecs) {
+    try { localStorage.setItem(cacheKey, encodeVectors(vecs)); } catch (e) {  }
+  }
+
+  // Embed the corpus chunks once, cached by (corpus_sha, model, digest): re-pulling a model under the same name must miss.
   function buildChunkVectors(onCacheMiss) {
-    var cacheKey = "gpa:vec3:" + knowledgeIndex.meta.corpus_sha + ":" + embedModel;
+    var cacheKey = "gpa:vec4:" + knowledgeIndex.meta.corpus_sha + ":" + embedModel + ":" + (modelDigests[embedModel] || "");
+    purgeStaleVectors("gpa:vec", cacheKey);
     try {
       var decoded = decodeVectors(localStorage.getItem(cacheKey) || "", knowledgeIndex.chunks.length);
       if (decoded) { chunkVectors = decoded; return Promise.resolve(true); }
     } catch (e) {  }
 
     if (onCacheMiss) onCacheMiss();
-    var texts = knowledgeIndex.chunks.map(function (c) { return c.heading + "\n" + c.text; });
-    return ollamaEmbed(embedModel, texts, "doc").then(function (vecs) {
+    return fetchVectorsFile().then(function (p) {
+      var shipped = usablePrecomputed(p) && decodeVectors(p.chunks || "", knowledgeIndex.chunks.length);
+      if (shipped) return shipped;
+      var texts = knowledgeIndex.chunks.map(function (c) { return c.heading + "\n" + c.text; });
+      return ollamaEmbed(embedModel, texts, "doc");
+    }).then(function (vecs) {
       chunkVectors = vecs;
-      try { localStorage.setItem(cacheKey, encodeVectors(vecs)); } catch (e) {  }
+      saveVectors(cacheKey, vecs);
       return true;
     });
   }
@@ -880,15 +922,20 @@
   function buildParamVectors() {
     var rows = buildParamRows();
     if (!rows.length) { paramRows = []; return Promise.resolve(true); }
-    var cacheKey = "gpa:pvec3:" + knowledgeIndex.meta.corpus_sha + ":" + embedModel;
+    var cacheKey = "gpa:pvec4:" + knowledgeIndex.meta.corpus_sha + ":" + embedModel + ":" + (modelDigests[embedModel] || "");
+    purgeStaleVectors("gpa:pvec", cacheKey);
     try {
       var decoded = decodeVectors(localStorage.getItem(cacheKey) || "", rows.length);
       if (decoded) { for (var i = 0; i < rows.length; i++) rows[i].vec = decoded[i]; paramRows = rows; return Promise.resolve(true); }
     } catch (e) {  }
-    return ollamaEmbed(embedModel, rows.map(function (r) { return r.text; }), "doc").then(function (vecs) {
+    return fetchVectorsFile().then(function (p) {
+      var shipped = usablePrecomputed(p) && decodeVectors(p.params || "", rows.length);
+      if (shipped) return shipped;
+      return ollamaEmbed(embedModel, rows.map(function (r) { return r.text; }), "doc");
+    }).then(function (vecs) {
       for (var j = 0; j < rows.length; j++) rows[j].vec = vecs[j];
       paramRows = rows;
-      try { localStorage.setItem(cacheKey, encodeVectors(vecs)); } catch (e) {  }
+      saveVectors(cacheKey, vecs);
       return true;
     }).catch(function () { paramRows = null; return false; });
   }
@@ -1226,6 +1273,8 @@
       .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
       .then(function (j) {
         var all = (j.models || []).map(function (m) { return m.name; });
+        modelDigests = {};
+        (j.models || []).forEach(function (m) { modelDigests[m.name] = m.digest || ""; });
         var isEmbed = function (n) { return /embed|bge|minilm|nomic|mxbai|arctic|gte|\be5\b/i.test(n); };
         chatModels = all.filter(function (n) { return !isEmbed(n); });
         embedModels = all.filter(isEmbed);
@@ -2089,6 +2138,7 @@
       _load: function (j) { knowledgeIndex = j; bm25 = prepareBm25(knowledgeIndex.chunks); _tokenOwnersCache = null; _anchorVocabCache = null; _headOwnersCache = null; },
       _setModel: function (m) { chatModel = m; },
       _setEmbedModel: function (m) { embedModel = m; },
+      _setModelDigests: function (d) { modelDigests = d; },
       _state: function () { return { embedModel: embedModel, haveVectors: !!chunkVectors, chunks: knowledgeIndex.chunks.length }; }
     };
   }
