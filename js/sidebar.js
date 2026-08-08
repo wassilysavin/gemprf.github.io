@@ -1,7 +1,7 @@
 (function loadAssistant() {
   if (document.getElementById("gpa-assistant-css")) return;
   if (document.getElementById("ai-assistant-btn")) return;
-  var v = "?v=21";  // cache
+  var v = "?v=22";  // cache
   const link = document.createElement("link");
   link.id = "gpa-assistant-css";
   link.rel = "stylesheet";

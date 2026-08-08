@@ -1845,9 +1845,11 @@
       "<code>ollama pull " + DEFAULT_MODEL + "</code>" +
       "2. Pull the embedding model (required for retrieval):" +
       "<code>ollama pull " + PREFERRED_EMBED + "</code>" +
-      "3. Allow this site to reach Ollama, then restart it:" +
-      "<code>launchctl setenv OLLAMA_ORIGINS \"" + origin + "\"   # macOS\n" +
-      "# Linux/manual:  OLLAMA_ORIGINS=\"" + origin + "\" ollama serve</code>" +
+      "3. Allow this site to reach Ollama — run the line for your system, then restart Ollama:" +
+      "<br>macOS:" +
+      "<code>launchctl setenv OLLAMA_ORIGINS \"" + origin + "\"</code>" +
+      "Linux, or when starting manually:" +
+      "<code>OLLAMA_ORIGINS=\"" + origin + "\" ollama serve</code>" +
       "<button class=\"gpa-btn gpa-secondary\" id=\"gpa-retry\">Retry connection</button>" +
       "<div class=\"gpa-disclaimer\">Note: needs a Chromium-based browser (Chrome/Edge/Brave). Safari blocks localhost requests from HTTPS pages.</div>";
   }
@@ -1916,28 +1918,20 @@
         if (retry) retry.addEventListener("click", connect);
         return;
       }
-      if (!probeResult.models.length) {
-        connected = false;
-        setStatus("off");
-        var noModelsBanner = showBanner("Ollama is running but has no chat models. Pull one:" +
-          "<code>ollama pull " + DEFAULT_MODEL + "</code>" +
-          "<button class=\"gpa-btn gpa-secondary\" id=\"gpa-retry\">Retry</button>", true);
-        var noModelsRetry = noModelsBanner.querySelector("#gpa-retry");
-        if (noModelsRetry) noModelsRetry.addEventListener("click", connect);
-        return;
-      }
-      // An embedding model is as mandatory as a chat model: no BM25-only fallback exists any more.
+      // Both roles are checked up front so a fresh visitor sees every missing pull in one banner.
       embedModel = pickEmbedModel(embedModels);
       chunkVectors = null;
       paramRows = null;
-      if (!embedModel) {
+      var missing = [];
+      if (!probeResult.models.length) missing.push("a chat model (writes the answers)<code>ollama pull " + DEFAULT_MODEL + "</code>");
+      if (!embedModel) missing.push("an embedding model (powers retrieval)<code>ollama pull " + PREFERRED_EMBED + "</code>");
+      if (missing.length) {
         connected = false;
         setStatus("off");
-        var noEmbedBanner = showBanner("Ollama is running but has no embedding model, which retrieval requires. Pull one:" +
-          "<code>ollama pull " + PREFERRED_EMBED + "</code>" +
+        var missingBanner = showBanner("Ollama is running but the assistant still needs " + missing.join(" and ") +
           "<button class=\"gpa-btn gpa-secondary\" id=\"gpa-retry\">Retry</button>", true);
-        var noEmbedRetry = noEmbedBanner.querySelector("#gpa-retry");
-        if (noEmbedRetry) noEmbedRetry.addEventListener("click", connect);
+        var missingRetry = missingBanner.querySelector("#gpa-retry");
+        if (missingRetry) missingRetry.addEventListener("click", connect);
         return;
       }
       connected = true;

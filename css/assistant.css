@@ -144,7 +144,8 @@
   background: #fff8e1; border: 1px solid #ffe0a3; color: #7a5900;
   border-radius: 10px; padding: 10px 12px;
 }
-.gpa-banner.gpa-error { background: #fdecea; border-color: #f5c6c0; color: #8a2820; }
+/* Mirrors the site's .callout.warning so the assistant matches the docs pages. */
+.gpa-banner.gpa-error { background: #fff3cd; border: none; border-left: 4px solid #e0a800; color: #856404; }
 /* Progress, not a warning: the amber banner reads as something being wrong, and nothing is. */
 .gpa-banner.gpa-indexing {
   background: var(--gpa-panel-bg); border-color: var(--gpa-border); color: var(--gpa-muted);
@@ -162,7 +163,7 @@
 .gpa-banner code {
   display: block; background: #23303a; color: #e6edf3;
   padding: 6px 8px; border-radius: 6px; margin: 6px 0; font-size: 12px;
-  overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+  overflow-x: auto; white-space: pre-wrap; overflow-wrap: break-word;
 }
 .gpa-banner .gpa-btn { margin-top: 8px; }
 
@@ -197,7 +198,7 @@
 .gpa-btn.gpa-secondary { background: #fff; color: var(--gpa-accent); border: 1px solid var(--gpa-accent); }
 .gpa-btn.gpa-secondary:hover { background: #eef6fb; }
 
-.gpa-disclaimer { font-size: 10.5px; color: var(--gpa-muted); text-align: center; margin-top: 6px; }
+.gpa-disclaimer { font-size: 10.5px; color: var(--gpa-muted); text-align: left; margin-top: 6px; }
 
 @media (max-width: 480px) {
   #gpa-panel { right: 8px; bottom: 8px; height: calc(100vh - 16px); }
