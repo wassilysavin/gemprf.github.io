@@ -1659,24 +1659,35 @@
 
   function chunkKey(c) { return c.id || (c.source_id + "|" + c.heading); }
 
-  // Longest matching probe wins, so a multi-word label beats a short alias another parameter also carries.
-  function codeParamForQuestion(question) {
+  // Every parameter the question names, most specifically-named first (longest matched probe).
+  function codeParamsForQuestion(question) {
     var q = " " + String(question || "").toLowerCase() + " ";
     var qSpaces = q.replace(/[_.]/g, " ");
-    var best = null, bestLen = 0;
+    var hits = [];
     (knowledgeIndex.parameters || []).forEach(function (p) {
       var probes = p.id.toLowerCase().split(".").concat(p.id.toLowerCase(), (p.label || "").toLowerCase());
       (p.aliases || []).forEach(function (a) { probes.push((a || "").toLowerCase()); });
+      var best = null, bestLen = 0;
       probes.forEach(function (probe) {
         probe = probe.trim();
         if (probe.length < 3) return;  // 2-char terms match inside common words
         var flat = probe.replace(/[_.]/g, " ");
         var re = new RegExp("(^|[^a-z0-9])" + probe.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([^a-z0-9]|$)");
-        if ((re.test(q) || qSpaces.indexOf(" " + flat + " ") !== -1) && probe.length > bestLen) { bestLen = probe.length; best = p; }
+        if ((re.test(q) || qSpaces.indexOf(" " + flat + " ") !== -1) && probe.length > bestLen) { bestLen = probe.length; best = probe; }
       });
+      if (best) hits.push({ spec: p, probe: best, len: bestLen });
     });
-    return best;
+    var byProbe = Object.create(null);
+    hits.forEach(function (h) { byProbe[h.probe] = (byProbe[h.probe] || 0) + 1; });
+    // A probe several matched parameters share is a family word naming none; drop those unless nothing else hit.
+    var distinct = hits.filter(function (h) { return byProbe[h.probe] === 1; });
+    if (!distinct.length) distinct = hits;
+    distinct.sort(function (a, b) { return b.len - a.len; });
+    return distinct.map(function (h) { return h.spec; });
   }
+
+  // Longest matching probe wins, so a multi-word label beats a short alias another parameter also carries.
+  function codeParamForQuestion(question) { return codeParamsForQuestion(question)[0] || null; }
 
   // Generic code tokens too common to locate a parameter's real usage lines.
   var GENERIC_CODE = {};
@@ -1709,50 +1720,57 @@
     return false;
   }
 
-  // Best chunk per code source, most param-dense first; falls back to the best retrieved code chunk.
+  function specTerms(spec) { return tokenize([spec.label].concat(spec.aliases || []).join(" ")); }
+
+  // Best chunk per code source for EVERY named parameter, grouped per parameter, most param-dense first
   function findCodeChunks(question, retrieval) {
-    var specs = retrieval.specs || [];
-    var namedSpec = codeParamForQuestion(question) || specs[0];
+    var named = codeParamsForQuestion(question);
+    if (!named.length && retrieval.specs && retrieval.specs[0]) named = [retrieval.specs[0]];
     var isCode = function (c) {
       var s = knowledgeIndex.sources[c.source_id];
       return s && s.kind === "code" && !/tests?[._/]|_test|test_/i.test(c.source_id);
     };
-    var terms = namedSpec ? tokenize([namedSpec.label].concat(namedSpec.aliases || []).join(" ")) : tokenize(question);
-    function termDensity(c) {
-      var t = c.text.toLowerCase(), s = 0;
-      terms.forEach(function (w) { var i = 0, n = 0; while ((i = t.indexOf(w, i)) !== -1) { n++; i += w.length; } s += n; });
-      if (/(^|\n)\s*(def|class)\s/.test(c.text)) s += 0.5;
-      return s;
-    }
-    var distinctive = terms.filter(function (w) { return w.length >= 3 && !GENERIC_CODE[w]; });
-    // The parameter as a quoted config key marks the real usage site, which a bare-word count misses.
-    function configBoost(c) {
-      var low = c.text.toLowerCase();
-      for (var i = 0; i < distinctive.length; i++) {
-        if (low.indexOf('"' + distinctive[i] + '"') !== -1 || low.indexOf("'" + distinctive[i] + "'") !== -1) return 1000;
-      }
-      return 0;
-    }
     // Pick within a source by base+boost (fixes an overloaded term), but order sources by base.
-    function bestIn(chunks) {
+    function bestIn(chunks, terms) {
+      var distinctive = terms.filter(function (w) { return w.length >= 3 && !GENERIC_CODE[w]; });
+      function termDensity(c) {
+        var t = c.text.toLowerCase(), s = 0;
+        terms.forEach(function (w) { var i = 0, n = 0; while ((i = t.indexOf(w, i)) !== -1) { n++; i += w.length; } s += n; });
+        if (/(^|\n)\s*(def|class)\s/.test(c.text)) s += 0.5;
+        return s;
+      }
+      // The parameter as a quoted config key marks the real usage site, which a bare-word count misses.
+      function configBoost(c) {
+        var low = c.text.toLowerCase();
+        for (var i = 0; i < distinctive.length; i++) {
+          if (low.indexOf('"' + distinctive[i] + '"') !== -1 || low.indexOf("'" + distinctive[i] + "'") !== -1) return 1000;
+        }
+        return 0;
+      }
       var best = null, bestBoosted = -1, bestBase = -1;
       chunks.forEach(function (c) { var base = termDensity(c), b = base + configBoost(c); if (b > bestBoosted) { best = c; bestBoosted = b; bestBase = base; } });
       return { chunk: best, base: bestBase, boosted: bestBoosted };
     }
-    var sids = namedSpec ? (namedSpec.code_source_ids || []) : [];
-    var picked = [];
-    sids.forEach(function (sid) {
-      var chunks = knowledgeIndex.chunks.filter(function (c) { return c.source_id === sid && isCode(c); });
-      if (!chunks.length) return;
-      var bestForSource = bestIn(chunks);
-      if (bestForSource.chunk && bestForSource.boosted > 0) picked.push(bestForSource);  // only sources where the parameter actually appears
-    });
-    if (picked.length) {
+    // Uncapped on purpose: the caller sizes the display, so a wants-more turn can serve the tail.
+    var out = [], seen = Object.create(null);
+    named.forEach(function (spec) {
+      var terms = specTerms(spec);
+      var picked = [];
+      (spec.code_source_ids || []).forEach(function (sid) {
+        var chunks = knowledgeIndex.chunks.filter(function (c) { return c.source_id === sid && isCode(c); });
+        if (!chunks.length) return;
+        var bestForSource = bestIn(chunks, terms);
+        if (!bestForSource.chunk || bestForSource.boosted <= 0) return;  // only sources where the parameter actually appears
+        if (seen[chunkKey(bestForSource.chunk)]) return;
+        seen[chunkKey(bestForSource.chunk)] = 1;
+        picked.push(bestForSource);
+      });
       picked.sort(function (a, b) { return b.base - a.base; });  // implementation (most param-dense) leads
-      return picked.slice(0, 5).map(function (p) { return p.chunk; });
-    }
+      picked.forEach(function (p) { out.push(p.chunk); });
+    });
+    if (out.length) return out;
     var pool = retrieval.chunks.filter(isCode);  // no curated match: best retrieved code chunk, or nothing
-    var f = bestIn(pool);
+    var f = bestIn(pool, named.length ? specTerms(named[0]) : tokenize(question));
     return f.chunk ? [f.chunk] : [];
   }
 
@@ -1763,9 +1781,11 @@
 
   // Honest terminus for a wants-more code request: re-showing the same excerpts would pass them off as new.
   function sayCodeExhausted(question, retrieval, standalone) {
-    var spec = codeParamForQuestion(standalone || question) || (retrieval.specs && retrieval.specs[0]);
-    var msg = "That's everything -- the indexed GEM-pRF code shows no further usage sites" +
-      (spec ? " for " + spec.label : "") + " beyond what I've already shown. " +
+    var specs = codeParamsForQuestion(standalone || question);
+    if (!specs.length && retrieval.specs && retrieval.specs[0]) specs = [retrieval.specs[0]];
+    var names = specs.slice(0, 3).map(function (s) { return s.label; }).join(" and ");
+    var msg = "That's everything -- I've already shown the main usage site in every indexed GEM-pRF code file" +
+      (names ? " that uses " + names : "") + ". " +
       "Ask about another setting, or about what the shown code does, and I'll answer from the sources.";
     activeBot.classList.remove("gpa-cursor");
     activeBot.innerHTML = renderMarkdown(msg);
@@ -1777,8 +1797,9 @@
   // Show code verbatim: the model rewrites real code (wrong signatures, dropped lines) when asked to quote it.
   function showCodeVerbatim(question, retrieval, codeChunks) {
     codeChunks.forEach(function (c) { shownCodeChunks[chunkKey(c)] = 1; });
-    var namedSpec = codeParamForQuestion(question) || (retrieval.specs && retrieval.specs[0]);
-    var terms = namedSpec ? tokenize([namedSpec.label].concat(namedSpec.aliases || []).join(" ")) : tokenize(question);
+    var namedSpecs = codeParamsForQuestion(question);
+    if (!namedSpecs.length && retrieval.specs && retrieval.specs[0]) namedSpecs = [retrieval.specs[0]];
+    var terms = namedSpecs.length ? tokenize(namedSpecs.map(function (s) { return [s.label].concat(s.aliases || []).join(" "); }).join(" ")) : tokenize(question);
     var blocks = codeChunks.map(function (c, i) {
       // Strips the indexer's breadcrumb line; the same pattern can bite a code line containing ' > '.
       var raw = String(c.text || "").replace(/^[^\n]{1,160} > [^\n]{0,160}\n+/, "").trim();
@@ -1823,11 +1844,13 @@
       var codeChunks = findCodeChunks(standalone || question, retrieval);
       if (codeChunks.length) {
         var unseen = codeChunks.filter(function (c) { return !shownCodeChunks[chunkKey(c)]; });
-        if (unseen.length === codeChunks.length) return showCodeVerbatim(question, retrieval, codeChunks);
+        if (unseen.length === codeChunks.length) return showCodeVerbatim(question, retrieval, codeChunks.slice(0, 5));
+        // A raw message that itself names a parameter is a targeted pick ('i mean nDCT'): show that code, seen or not.
+        if (codeParamsForQuestion(question).length) return showCodeVerbatim(question, retrieval, codeChunks.slice(0, 5));
         // Repeat-bound: whether they want MORE or a re-show is a speech act, so a classifier reads it.
         return asksForMoreCode(question).then(function (more) {
-          if (!more) return showCodeVerbatim(question, retrieval, codeChunks);
-          return unseen.length ? showCodeVerbatim(question, retrieval, unseen) : sayCodeExhausted(question, retrieval, standalone);
+          if (!more) return showCodeVerbatim(question, retrieval, codeChunks.slice(0, 5));
+          return unseen.length ? showCodeVerbatim(question, retrieval, unseen.slice(0, 5)) : sayCodeExhausted(question, retrieval, standalone);
         });
       }
     }
@@ -2207,7 +2230,7 @@
       evidenceClass: evidenceClass, hasProseEvidence: hasProseEvidence,
       termFork: forkCandidates, forkQuestion: forkQuestion, forkIsTheSubject: forkIsTheSubject, CLARIFY_DIRECTIVE: CLARIFY_DIRECTIVE,
       resolveForkReply: resolveForkReply, foldClarifyReply: foldClarifyReply, forkReaskQuestion: forkReaskQuestion,
-      isCodeRequest: isCodeRequest, codeParamForQuestion: codeParamForQuestion, findCodeChunk: findCodeChunk, findCodeChunks: findCodeChunks,
+      isCodeRequest: isCodeRequest, codeParamForQuestion: codeParamForQuestion, codeParamsForQuestion: codeParamsForQuestion, findCodeChunk: findCodeChunk, findCodeChunks: findCodeChunks,
       namesParameter: namesParameter, valueClarifyingQuestion: valueClarifyFallback,
       needsGoal: needsGoal, engageWithoutEvidence: engageWithoutEvidence, asksForMoreCode: asksForMoreCode,
       INTERACTIVE_NO_EVIDENCE_MESSAGE: INTERACTIVE_NO_EVIDENCE_MESSAGE,
