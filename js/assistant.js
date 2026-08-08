@@ -289,6 +289,8 @@
   var activeBot = null;
   var pendingClarify = null;
   var valueChoiceActive = false;
+  // Code chunks already rendered this conversation, so 'anything else?' can converge instead of repeating.
+  var shownCodeChunks = Object.create(null);
   var els = {};
 
   // Lowercase word tokens minus stopwords. '.' and '_' stay INSIDE a token so paper.full survives whole.
@@ -1631,6 +1633,26 @@
     return /\bcode\b|\bimplementation\b|\bsource[- ]?code\b/i.test(q || "");
   }
 
+  var CODE_MORE_SYSTEM =
+    "You triage follow-ups for a GEM-pRF documentation assistant. The assistant has just shown the user " +
+    "source-code excerpts, and the user's next message routed to the same code again.\n" +
+    "Answer YES only if the message asks for ADDITIONAL or DIFFERENT material beyond what was already " +
+    "shown -- further usage sites, other examples, whatever else there is.\n" +
+    "Answer NO in every other case: the message asks to see the same code again, asks a question ABOUT " +
+    "the code shown, or asks something new that stands on its own.\n" +
+    "Reply with exactly one word: YES or NO.";
+
+  // True when a repeat-bound code request wants MORE, not a re-show. Fails open: repeating costs a scroll.
+  function asksForMoreCode(question, complete) {
+    return (complete || chatComplete)([
+      { role: "system", content: CODE_MORE_SYSTEM },
+      { role: "user", content: question }
+    ]).then(function (t) { return (t || "").trim().toUpperCase().indexOf("YES") === 0; })
+      .catch(function () { return false; });
+  }
+
+  function chunkKey(c) { return c.id || (c.source_id + "|" + c.heading); }
+
   // Longest matching probe wins, so a multi-word label beats a short alias another parameter also carries.
   function codeParamForQuestion(question) {
     var q = " " + String(question || "").toLowerCase() + " ";
@@ -1733,8 +1755,22 @@
     return arr.length ? arr[0] : null;
   }
 
+  // Honest terminus for a wants-more code request: re-showing the same excerpts would pass them off as new.
+  function sayCodeExhausted(question, retrieval, standalone) {
+    var spec = codeParamForQuestion(standalone || question) || (retrieval.specs && retrieval.specs[0]);
+    var msg = "That's everything -- the indexed GEM-pRF code shows no further usage sites" +
+      (spec ? " for " + spec.label : "") + " beyond what I've already shown. " +
+      "Ask about another setting, or about what the shown code does, and I'll answer from the sources.";
+    activeBot.classList.remove("gpa-cursor");
+    activeBot.innerHTML = renderMarkdown(msg);
+    recordTurn(question, msg);
+    scrollDown();
+    return Promise.resolve();
+  }
+
   // Show code verbatim: the model rewrites real code (wrong signatures, dropped lines) when asked to quote it.
   function showCodeVerbatim(question, retrieval, codeChunks) {
+    codeChunks.forEach(function (c) { shownCodeChunks[chunkKey(c)] = 1; });
     var namedSpec = codeParamForQuestion(question) || (retrieval.specs && retrieval.specs[0]);
     var terms = namedSpec ? tokenize([namedSpec.label].concat(namedSpec.aliases || []).join(" ")) : tokenize(question);
     var blocks = codeChunks.map(function (c, i) {
@@ -1780,7 +1816,13 @@
     if (isCodeRequest(standalone || question)) {
       var codeChunks = findCodeChunks(standalone || question, retrieval);
       if (codeChunks.length) {
-        return showCodeVerbatim(question, retrieval, codeChunks);
+        var unseen = codeChunks.filter(function (c) { return !shownCodeChunks[chunkKey(c)]; });
+        if (unseen.length === codeChunks.length) return showCodeVerbatim(question, retrieval, codeChunks);
+        // Repeat-bound: whether they want MORE or a re-show is a speech act, so a classifier reads it.
+        return asksForMoreCode(question).then(function (more) {
+          if (!more) return showCodeVerbatim(question, retrieval, codeChunks);
+          return unseen.length ? showCodeVerbatim(question, retrieval, unseen) : sayCodeExhausted(question, retrieval, standalone);
+        });
       }
     }
     var isFollowup = !!standalone && normalizeQuestion(standalone) !== normalizeQuestion(question);
@@ -2161,7 +2203,7 @@
       resolveForkReply: resolveForkReply, foldClarifyReply: foldClarifyReply, forkReaskQuestion: forkReaskQuestion,
       isCodeRequest: isCodeRequest, codeParamForQuestion: codeParamForQuestion, findCodeChunk: findCodeChunk, findCodeChunks: findCodeChunks,
       namesParameter: namesParameter, valueClarifyingQuestion: valueClarifyFallback,
-      needsGoal: needsGoal, engageWithoutEvidence: engageWithoutEvidence,
+      needsGoal: needsGoal, engageWithoutEvidence: engageWithoutEvidence, asksForMoreCode: asksForMoreCode,
       INTERACTIVE_NO_EVIDENCE_MESSAGE: INTERACTIVE_NO_EVIDENCE_MESSAGE,
       streamChat: streamChat, SYSTEM_PROMPT: SYSTEM_PROMPT,
       INSUFFICIENT_EVIDENCE_MESSAGE: INSUFFICIENT_EVIDENCE_MESSAGE, isRefusal: isRefusal,
