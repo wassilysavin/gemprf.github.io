@@ -178,6 +178,13 @@
     "convert what they gave into a number, say that plainly in one sentence and then give them what it DOES " +
     "support, rather than closing on what is missing. Do NOT end with a question.";
 
+  // Human-prompt suffix on the turn that ANSWERS a fork clarify: the user named this setting; the answer must too.
+  function forkAnswerDirective(label) {
+    return "\n\nThe user has just clarified that they mean the " + label + " setting. Anchor the answer on that " +
+      "setting, naming it explicitly. Where the evidence does not answer part of the question for that setting, " +
+      "say so for that setting by name -- do not silently answer about a different setting instead.";
+  }
+
   // Used when clarifying is allowed; the flat refusal is used when it is not.
   var INTERACTIVE_NO_EVIDENCE_MESSAGE =
     "I don't have a grounded answer for that in the GEM-pRF paper, docs, or package code. If you're " +
@@ -1261,13 +1268,14 @@
   }
 
   // History feeds genuine follow-ups only; the two directives exclude each other by construction.
-  function buildHumanPrompt(question, retrieval, isFollowup, allowClarify, valueAnswer) {
+  function buildHumanPrompt(question, retrieval, isFollowup, allowClarify, valueAnswer, forkPick) {
     return "Conversation history (reference resolution only; NOT evidence):\n" +
       (isFollowup ? historyContext() : "- none") + "\n\n" +
       "Question: " + question + "\n\n" +
       "Matched parameters:\n" + parameterContext(retrieval.specs) + "\n\n" +
       "Evidence (each item is `[class | source_id heading_path] text`):\n" + evidenceContext(retrieval.chunks) +
       operativeRule(retrieval.chunks) +
+      (forkPick ? forkAnswerDirective(forkPick) : "") +
       (valueAnswer ? VALUE_ANSWER_DIRECTIVE : (allowClarify ? CLARIFY_DIRECTIVE : ""));
   }
 
@@ -1371,12 +1379,12 @@
   }
 
   // onPartial gets the WHOLE answer accumulated so far on every chunk, not the newest delta.
-  function streamChat(question, retrieval, onPartial, isFollowup, allowClarify, valueAnswer) {
+  function streamChat(question, retrieval, onPartial, isFollowup, allowClarify, valueAnswer, forkPick) {
     var body = {
       model: chatModel,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: buildHumanPrompt(question, retrieval, isFollowup, allowClarify, valueAnswer) }
+        { role: "user", content: buildHumanPrompt(question, retrieval, isFollowup, allowClarify, valueAnswer, forkPick) }
       ],
       stream: true,
       think: false,  // = Python reasoning_effort=none
@@ -1762,7 +1770,7 @@
   }
 
   // Normal answer path: stream, refuse honestly, or ask one CLARIFY question.
-  function answerNormally(question, retrieval, standalone, allowClarify, valueAnswer) {
+  function answerNormally(question, retrieval, standalone, allowClarify, valueAnswer, forkPick) {
     var refusalMsg = allowClarify ? INTERACTIVE_NO_EVIDENCE_MESSAGE : INSUFFICIENT_EVIDENCE_MESSAGE;
     if (!retrieval.chunks.length) {
       var noEv = allowClarify ? engageWithoutEvidence(question) : Promise.resolve(INSUFFICIENT_EVIDENCE_MESSAGE);
@@ -1787,7 +1795,7 @@
       else if (isRefusal(full)) activeBot.innerHTML = renderMarkdown(refusalMsg);
       else activeBot.innerHTML = renderMarkdown(full);
       scrollDown();
-    }, isFollowup, allowClarify, valueAnswer).then(function () {
+    }, isFollowup, allowClarify, valueAnswer, forkPick).then(function () {
       activeBot.classList.remove("gpa-cursor");
       if (isClarify(streamedText)) {
         var clarifyQuestion = clarifyText(streamedText) || "Could you say a bit more about what you're trying to do?";
@@ -1804,7 +1812,7 @@
   }
 
   // Core turn: condense, retrieve, then route to value-clarify, fork-clarify, or answer.
-  function corePipeline(question, allowClarify, valueAnswer) {
+  function corePipeline(question, allowClarify, valueAnswer, forkPick) {
     return contextualize(question).then(function (condensed) {
       var standalone = (normalizeQuestion(question) !== normalizeQuestion(condensed)) ? condensed : question;
       var isFollowup = normalizeQuestion(standalone) !== normalizeQuestion(question);
@@ -1833,7 +1841,7 @@
             askClarify(question, forkQuestion(fork), false, fork);
             return;
           }
-          return answerNormally(question, retrieval, standalone, clarifying, valueAnswer);
+          return answerNormally(question, retrieval, standalone, clarifying, valueAnswer, forkPick);
         });
       });
     });
@@ -1896,7 +1904,7 @@
         return;
       }
       var folded = keep ? foldClarifyReply(original, question, fork, asked) : original;
-      corePipeline(folded, false, keep && valueChoice).catch(fail).then(done);
+      corePipeline(folded, false, keep && valueChoice, picked && picked.label).catch(fail).then(done);
       return;
     }
 
