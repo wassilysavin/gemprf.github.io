@@ -682,10 +682,40 @@
     return folded + (onlySelects ? "" : " " + reply);
   }
 
-  // Second ask, after a reply named none of the candidates: number them so a positional answer works.
-  function forkReaskQuestion(fork) {
+  // Reply words every candidate answers to: matched, but unable to pick ('visual' names both radii).
+  function forkSharedWords(reply, fork) {
+    var surfaces = fork.map(surfaceWords);
+    return nameWords(reply).filter(function (w) {
+      if (STOPWORDS.has(w) || SELECTION_NOISE.has(w)) return false;
+      return surfaces.every(function (surf) {
+        return Object.keys(surf).some(function (s) { return w === s || (editBudget(s) && withinEdits(w, s, editBudget(s))); });
+      });
+    });
+  }
+
+  // One label word per candidate no other candidate answers to; catalog-rarest, so it names little else.
+  function forkHintWords(fork) {
+    var owners = tokenOwners();
+    var rarity = function (w) { return Object.keys(owners[w] || {}).length; };
+    return fork.map(function (spec, i) {
+      var others = fork.filter(function (_, j) { return j !== i; }).map(surfaceWords);
+      var unique = nameWords(spec.label).filter(function (w) {
+        return w.length > 2 && !STOPWORDS.has(w) && !others.some(function (surf) { return surf[w]; });
+      });
+      unique.sort(function (a, b) { return rarity(a) - rarity(b); });
+      return unique[0] || null;
+    });
+  }
+
+  // Second ask, numbered so a positional answer works; a reply that named ALL candidates is taught a winnable word.
+  function forkReaskQuestion(fork, reply) {
     var numbered = fork.map(function (s, i) { return (i + 1) + ") " + s.label; }).join("   ");
-    return "Sorry -- I couldn't tell which of those you meant. Pick one by name or number: " + numbered;
+    var shared = reply ? forkSharedWords(reply, fork) : [];
+    if (!shared.length) return "Sorry -- I couldn't tell which of those you meant. Pick one by name or number: " + numbered;
+    var hints = forkHintWords(fork);
+    var say = hints.every(Boolean) ? "say \"" + hints.join("\" or \"") + "\", or " : "";
+    return "\"" + shared.join(" ") + "\" matches " + (fork.length === 2 ? "both" : "all") + " of those, so it can't pick one -- " +
+      say + "pick a number: " + numbered;
   }
 
   function forkQuestion(fork) {
@@ -1861,7 +1891,7 @@
       var picked = keep ? resolveForkReply(question, fork) : null;
       // Unreadable reply: re-ask rather than let the ranking pick. Value clarifies reply with a goal, so are exempt.
       if (keep && !picked && !valueChoice && !reAsked && fork && fork.length >= 2) {
-        askClarify(original, forkReaskQuestion(fork), false, fork, true);
+        askClarify(original, forkReaskQuestion(fork, question), false, fork, true);
         done();
         return;
       }
