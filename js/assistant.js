@@ -1682,6 +1682,11 @@
     // A probe several matched parameters share is a family word naming none; drop those unless nothing else hit.
     var distinct = hits.filter(function (h) { return byProbe[h.probe] === 1; });
     if (!distinct.length) distinct = hits;
+    // A probe living inside another matched probe was not named itself ('visual field' inside the grid label).
+    var flat = function (p) { return p.replace(/[_.]/g, " "); };
+    distinct = distinct.filter(function (h) {
+      return !distinct.some(function (o) { return o !== h && o.len > h.len && flat(o.probe).indexOf(flat(h.probe)) !== -1; });
+    });
     distinct.sort(function (a, b) { return b.len - a.len; });
     return distinct.map(function (h) { return h.spec; });
   }
@@ -1722,6 +1727,60 @@
 
   function specTerms(spec) { return tokenize([spec.label].concat(spec.aliases || []).join(" ")); }
 
+  // Corpus-derived usage sites per parameter: a quoted config-key hit is certain, a bare identifier is a candidate.
+  var _usageSitesCache = Object.create(null);
+  function codeUsageSites(spec) {
+    if (_usageSitesCache[spec.id]) return _usageSitesCache[spec.id];
+    var probes = [];
+    [spec.label].concat(spec.aliases || [], spec.id.split(".").slice(-1)).forEach(function (a) {
+      var low = String(a || "").toLowerCase().trim();
+      [low, low.replace(/ /g, "_")].forEach(function (f) {
+        if (f.length >= 4 && f.indexOf(" ") === -1 && !GENERIC_CODE[f] && probes.indexOf(f) === -1) probes.push(f);
+      });
+    });
+    var sids = [], texts = Object.create(null);
+    knowledgeIndex.chunks.forEach(function (c) {
+      var s = knowledgeIndex.sources[c.source_id];
+      if (!s || s.kind !== "code" || /tests?[._/]|_test|test_/i.test(c.source_id)) return;
+      if (!texts[c.source_id]) { texts[c.source_id] = ""; sids.push(c.source_id); }
+      texts[c.source_id] += " " + c.text.toLowerCase();
+    });
+    var bareRe = Object.create(null);
+    probes.forEach(function (p) { bareRe[p] = new RegExp("(^|[^a-z0-9_])" + p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([^a-z0-9_]|$)"); });
+    var strong = [], weakByProbe = Object.create(null);
+    sids.forEach(function (sid) {
+      var t = texts[sid], quoted = false, bare = [];
+      probes.forEach(function (p) {
+        if (t.indexOf('"' + p + '"') !== -1 || t.indexOf("'" + p + "'") !== -1) quoted = true;
+        else if (bareRe[p].test(t)) bare.push(p);
+      });
+      if (quoted) strong.push(sid);
+      else bare.forEach(function (p) { (weakByProbe[p] = weakByProbe[p] || []).push(sid); });
+    });
+    // A probe bare-matching over a quarter of the code files identifies nothing ('space'); its bare hits are noise.
+    var weak = [];
+    Object.keys(weakByProbe).forEach(function (p) {
+      if (weakByProbe[p].length > sids.length / 4) return;
+      weakByProbe[p].forEach(function (sid) { if (weak.indexOf(sid) === -1 && strong.indexOf(sid) === -1) weak.push(sid); });
+    });
+    return (_usageSitesCache[spec.id] = { strong: strong, weak: weak });
+  }
+
+  // The complete-coverage line: every derived usage file that got no block is still named.
+  function codeMentionLine(specs, shownSids) {
+    var extra = [], seen = Object.create(null);
+    (shownSids || []).forEach(function (s) { seen[s] = 1; });
+    (specs || []).forEach(function (spec) {
+      var sites = codeUsageSites(spec);
+      (spec.code_source_ids || []).concat(sites.strong, sites.weak).forEach(function (sid) {
+        if (seen[sid]) return;
+        seen[sid] = 1;
+        extra.push((knowledgeIndex.sources[sid] && knowledgeIndex.sources[sid].title) || sid);
+      });
+    });
+    return extra.length ? "\n\n_Also referenced in: " + extra.join(", ") + "_" : "";
+  }
+
   // Best chunk per code source for EVERY named parameter, grouped per parameter, most param-dense first
   function findCodeChunks(question, retrieval) {
     var named = codeParamsForQuestion(question);
@@ -1756,7 +1815,10 @@
     named.forEach(function (spec) {
       var terms = specTerms(spec);
       var picked = [];
-      (spec.code_source_ids || []).forEach(function (sid) {
+      // Curation is a precision hint, not the reach: corpus-derived quoted-key sites join the block list.
+      var blockSids = (spec.code_source_ids || []).slice();
+      codeUsageSites(spec).strong.forEach(function (sid) { if (blockSids.indexOf(sid) === -1) blockSids.push(sid); });
+      blockSids.forEach(function (sid) {
         var chunks = knowledgeIndex.chunks.filter(function (c) { return c.source_id === sid && isCode(c); });
         if (!chunks.length) return;
         var bestForSource = bestIn(chunks, terms);
@@ -1808,7 +1870,8 @@
       var title = (knowledgeIndex.sources[c.source_id] && knowledgeIndex.sources[c.source_id].title) || c.source_id;
       return { title: title, code: code, src: c.source_id };
     });
-    var md = blocks.map(function (b) { return "**" + b.title + "**\n\n```python\n" + b.code + "\n```"; }).join("\n\n");
+    var md = blocks.map(function (b) { return "**" + b.title + "**\n\n```python\n" + b.code + "\n```"; }).join("\n\n") +
+      codeMentionLine(namedSpecs, blocks.map(function (b) { return b.src; }));
     var srcList = blocks.map(function (b) { return b.src; }).join(", ");
     activeBot.classList.remove("gpa-cursor");
     activeBot.innerHTML = renderMarkdown(md + "\n\n_explaining…_");
@@ -2231,6 +2294,7 @@
       termFork: forkCandidates, forkQuestion: forkQuestion, forkIsTheSubject: forkIsTheSubject, CLARIFY_DIRECTIVE: CLARIFY_DIRECTIVE,
       resolveForkReply: resolveForkReply, foldClarifyReply: foldClarifyReply, forkReaskQuestion: forkReaskQuestion,
       isCodeRequest: isCodeRequest, codeParamForQuestion: codeParamForQuestion, codeParamsForQuestion: codeParamsForQuestion, findCodeChunk: findCodeChunk, findCodeChunks: findCodeChunks,
+      codeUsageSites: codeUsageSites, codeMentionLine: codeMentionLine,
       namesParameter: namesParameter, valueClarifyingQuestion: valueClarifyFallback,
       needsGoal: needsGoal, engageWithoutEvidence: engageWithoutEvidence, asksForMoreCode: asksForMoreCode,
       INTERACTIVE_NO_EVIDENCE_MESSAGE: INTERACTIVE_NO_EVIDENCE_MESSAGE,
@@ -2243,8 +2307,8 @@
       analyzeFold: retrieveAndAnswer, generateAnswer: generateAnswer,
       _setHistory: function (h) { history = h; },
       pickEmbedModel: pickEmbedModel, buildChunkVectors: buildChunkVectors, ollamaEmbed: ollamaEmbed,
-      // A test swapping the index must clear these three caches.
-      _load: function (j) { knowledgeIndex = j; bm25 = prepareBm25(knowledgeIndex.chunks); _tokenOwnersCache = null; _anchorVocabCache = null; _headOwnersCache = null; },
+      // A test swapping the index must clear these four caches.
+      _load: function (j) { knowledgeIndex = j; bm25 = prepareBm25(knowledgeIndex.chunks); _tokenOwnersCache = null; _anchorVocabCache = null; _headOwnersCache = null; _usageSitesCache = Object.create(null); },
       _setModel: function (m) { chatModel = m; },
       _setEmbedModel: function (m) { embedModel = m; },
       _setModelDigests: function (d) { modelDigests = d; },
