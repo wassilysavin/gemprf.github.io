@@ -581,10 +581,10 @@
     return out;
   }
 
-  // Levenshtein distance, abandoned once the whole row exceeds `max`.
+  // Damerau (OSA) distance -- an adjacent transposition ('soruce') costs 1 -- abandoned once the row exceeds `max`.
   function withinEdits(word, target, max) {
     if (Math.abs(word.length - target.length) > max) return false;
-    var prev = [], cur = [], j;
+    var prev2 = [], prev = [], cur = [], j;
     for (j = 0; j <= target.length; j++) prev[j] = j;
     for (var i = 1; i <= word.length; i++) {
       cur[0] = i;
@@ -592,11 +592,14 @@
       for (j = 1; j <= target.length; j++) {
         var cost = word.charAt(i - 1) === target.charAt(j - 1) ? 0 : 1;
         cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+        if (i > 1 && j > 1 && word.charAt(i - 1) === target.charAt(j - 2) && word.charAt(i - 2) === target.charAt(j - 1)) {
+          cur[j] = Math.min(cur[j], prev2[j - 2] + 1);
+        }
         if (cur[j] < rowBest) rowBest = cur[j];
       }
       // Whole row over budget, so no continuation comes back under it.
       if (rowBest > max) return false;
-      var swap = prev; prev = cur; cur = swap;
+      var swap = prev2; prev2 = prev; prev = cur; cur = swap;
     }
     return prev[target.length] <= max;
   }
@@ -770,6 +773,41 @@
     return vocab.collapsed.some(function (c) { return compact.indexOf(c) !== -1; });
   }
 
+  var _queryVocabCache = null;
+
+  // Every token the corpus or catalog knows; a query word found here is never treated as a typo.
+  function queryVocab() {
+    if (_queryVocabCache) return _queryVocabCache;
+    var vocab = Object.create(null);
+    (knowledgeIndex.chunks || []).forEach(function (c) {
+      nameWords(c.heading + " " + c.text).forEach(function (w) { vocab[w] = 1; });
+    });
+    (knowledgeIndex.parameters || []).forEach(function (p) {
+      nameWords([p.label, p.id, p.xml_path].concat(p.aliases || []).join(" ")).forEach(function (w) { vocab[w] = 1; });
+    });
+    _queryVocabCache = vocab;
+    return vocab;
+  }
+
+  // Correct OOV words toward the corpus lexicon: >=5 chars, same first letter, unique winner at the smallest edit budget.
+  function spellNormalize(question) {
+    var vocab = queryVocab();
+    return String(question || "").replace(/[A-Za-z0-9_]+/g, function (word) {
+      var w = word.toLowerCase();
+      if (w.length < 5 || vocab[w]) return word;
+      for (var budget = 1; budget <= editBudget(w); budget++) {
+        var hit = null;
+        for (var t in vocab) {
+          if (t.length < 5 || t.charAt(0) !== w.charAt(0) || !withinEdits(w, t, budget)) continue;
+          if (hit !== null) return word;
+          hit = t;
+        }
+        if (hit) return hit;
+      }
+      return word;
+    });
+  }
+
   // Fixed value-choice clarify asking the user's goal (fallback template).
   function valueClarifyFallback(fork, namesSetting) {
     var goal = "what are you optimizing for -- " + GOAL_TRIAD + "?";
@@ -784,7 +822,8 @@
     return /^[A-Z][a-z]/.test(text) ? text.charAt(0).toLowerCase() + text.slice(1) : text;
   }
 
-  function generateValueClarify(question, retrieval, fork) {
+  // `complete` is injectable for tests, like forkIsTheSubject.
+  function generateValueClarify(question, retrieval, fork, complete) {
     var focusSpecs = fork.length ? fork : (retrieval.specs || []).slice(0, 1);
     // Nothing matched: tailoring to a "- none" setting block invents an angle, so ask the fixed question instead.
     if (!focusSpecs.length) return Promise.resolve(valueClarifyFallback(fork, namesParameter(question)));
@@ -793,12 +832,12 @@
       .map(function (c) { return "- " + (c.heading || c.source_id) + ": " + c.text.split(/\s+/).join(" ").slice(0, 600); })
       .join("\n") || "- none";
     var human = "User question: " + question + "\n\nThe setting the user is asking about:\n" +
-      parameterContext(focusSpecs) + "\n\nWhat the documentation says:\n" + evidence +
+      parameterContext(question, focusSpecs) + "\n\nWhat the documentation says:\n" + evidence +
       // Which setting they mean is prepended below, so the model is told not to spend its one question on it.
       (fork.length ? "\n\nWhich of these the user means is ALREADY being asked, ahead of your question -- do " +
         "not ask it again: " + fork.map(function (s) { return s.label; }).join(", ") : "") +
       "\n\nYour one clarifying question:";
-    return chatComplete([
+    return (complete || chatComplete)([
       { role: "system", content: VALUE_CLARIFY_SYSTEM },
       { role: "user", content: human }
     ]).then(function (t) {
@@ -1233,7 +1272,11 @@
     return "\n\nDecision reminder for this turn: " + (hasProseEvidence(chunks)
       ? "`prose` evidence IS present above, so the source-class gate does not apply this turn. " +
         "The general rule governs: answer if an item supports the fact, refuse if none does. " +
-        "Prose being present is not itself support -- it may address a different topic."
+        "Prose being present is not itself support -- it may address a different topic. " +
+        "Support means an item states the asked fact itself: an item about a neighbouring fact " +
+        "(where files go, what a section contains) does not support a claim about the asked fact, " +
+        "such as a format or a value. Drop any sentence you cannot trace to an item above; if " +
+        "nothing survives, refuse."
       : "NO `prose` evidence was retrieved -- every item above is `sample` or `code`. If the " +
         "question asks about UI behavior, a recommended or default value, or the runtime " +
         "semantics of a configurator toggle, reply 'INSUFFICIENT_EVIDENCE: <one-sentence " +
@@ -1241,11 +1284,26 @@
         "structure, numbers stated in the text -- answer normally from the items above.");
   }
 
-  function parameterContext(specs) {
-    if (!specs.length) return "- none";
-    return specs.map(function (p) {
-      return "- " + p.label + " (" + p.xml_path + "): " + p.summary + " " + p.significance;
-    }).join("\n");
+  // A spec the question literally names may anchor the answer; a similarity match may only inform it.
+  function specNamedIn(question, spec) {
+    var qjoin = " " + nameWords(question).join(" ") + " ";
+    return [spec.label].concat(spec.aliases || []).some(function (probe) {
+      var pw = nameWords(probe);
+      if (!pw.length || (pw.length === 1 && pw[0].length < 3)) return false;
+      return qjoin.indexOf(" " + pw.join(" ") + " ") !== -1;
+    });
+  }
+
+  function parameterContext(question, specs) {
+    var line = function (p) { return "- " + p.label + " (" + p.xml_path + "): " + p.summary + " " + p.significance; };
+    var named = [], related = [];
+    specs.forEach(function (p) { (specNamedIn(question, p) ? named : related).push(p); });
+    var out = named.length ? named.map(line).join("\n") : "- none";
+    if (related.length) {
+      out += "\n\nPossibly related settings (matched by wording similarity only; the question does not " +
+        "name them -- do not anchor the answer on them):\n" + related.map(line).join("\n");
+    }
+    return out;
   }
 
   function historyTranscript() {
@@ -1280,7 +1338,7 @@
     return "Conversation history (reference resolution only; NOT evidence):\n" +
       (isFollowup ? historyContext() : "- none") + "\n\n" +
       "Question: " + question + "\n\n" +
-      "Matched parameters:\n" + parameterContext(retrieval.specs) + "\n\n" +
+      "Matched parameters:\n" + parameterContext(question, retrieval.specs) + "\n\n" +
       "Evidence (each item is `[class | source_id heading_path] text`):\n" + evidenceContext(retrieval.chunks) +
       operativeRule(retrieval.chunks) +
       (forkPick ? forkAnswerDirective(forkPick) : "") +
@@ -1816,6 +1874,8 @@
       var terms = specTerms(spec);
       var picked = [];
       // Curation is a precision hint, not the reach: corpus-derived quoted-key sites join the block list.
+      var curatedSids = Object.create(null);
+      (spec.code_source_ids || []).forEach(function (sid) { curatedSids[sid] = 1; });
       var blockSids = (spec.code_source_ids || []).slice();
       codeUsageSites(spec).strong.forEach(function (sid) { if (blockSids.indexOf(sid) === -1) blockSids.push(sid); });
       blockSids.forEach(function (sid) {
@@ -1825,9 +1885,11 @@
         if (!bestForSource.chunk || bestForSource.boosted <= 0) return;  // only sources where the parameter actually appears
         if (seen[chunkKey(bestForSource.chunk)]) return;
         seen[chunkKey(bestForSource.chunk)] = 1;
+        bestForSource.curated = curatedSids[sid] ? 1 : 0;
         picked.push(bestForSource);
       });
-      picked.sort(function (a, b) { return b.base - a.base; });  // implementation (most param-dense) leads
+      // Curated sites lead: curation is verified usage, a derived quoted-key hit is a guess; density breaks ties.
+      picked.sort(function (a, b) { return (b.curated - a.curated) || (b.base - a.base); });
       picked.forEach(function (p) { out.push(p.chunk); });
     });
     if (out.length) return out;
@@ -1947,6 +2009,8 @@
 
   // Core turn: condense, retrieve, then route to value-clarify, fork-clarify, or answer.
   function corePipeline(question, allowClarify, valueAnswer, forkPick) {
+    // The chat bubble already shows the user's own words; every internal layer gets the corrected form.
+    question = spellNormalize(question);
     return contextualize(question).then(function (condensed) {
       var standalone = (normalizeQuestion(question) !== normalizeQuestion(condensed)) ? condensed : question;
       var isFollowup = normalizeQuestion(standalone) !== normalizeQuestion(question);
@@ -2295,7 +2359,8 @@
       resolveForkReply: resolveForkReply, foldClarifyReply: foldClarifyReply, forkReaskQuestion: forkReaskQuestion,
       isCodeRequest: isCodeRequest, codeParamForQuestion: codeParamForQuestion, codeParamsForQuestion: codeParamsForQuestion, findCodeChunk: findCodeChunk, findCodeChunks: findCodeChunks,
       codeUsageSites: codeUsageSites, codeMentionLine: codeMentionLine,
-      namesParameter: namesParameter, valueClarifyingQuestion: valueClarifyFallback,
+      namesParameter: namesParameter, spellNormalize: spellNormalize, valueClarifyingQuestion: valueClarifyFallback,
+      generateValueClarify: generateValueClarify,
       needsGoal: needsGoal, engageWithoutEvidence: engageWithoutEvidence, asksForMoreCode: asksForMoreCode,
       INTERACTIVE_NO_EVIDENCE_MESSAGE: INTERACTIVE_NO_EVIDENCE_MESSAGE,
       streamChat: streamChat, SYSTEM_PROMPT: SYSTEM_PROMPT,
@@ -2308,7 +2373,7 @@
       _setHistory: function (h) { history = h; },
       pickEmbedModel: pickEmbedModel, buildChunkVectors: buildChunkVectors, ollamaEmbed: ollamaEmbed,
       // A test swapping the index must clear these four caches.
-      _load: function (j) { knowledgeIndex = j; bm25 = prepareBm25(knowledgeIndex.chunks); _tokenOwnersCache = null; _anchorVocabCache = null; _headOwnersCache = null; _usageSitesCache = Object.create(null); },
+      _load: function (j) { knowledgeIndex = j; bm25 = prepareBm25(knowledgeIndex.chunks); _tokenOwnersCache = null; _anchorVocabCache = null; _headOwnersCache = null; _queryVocabCache = null; _usageSitesCache = Object.create(null); },
       _setModel: function (m) { chatModel = m; },
       _setEmbedModel: function (m) { embedModel = m; },
       _setModelDigests: function (d) { modelDigests = d; },

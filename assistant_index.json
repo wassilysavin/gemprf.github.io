@@ -1,7 +1,7 @@
 {
   "meta": {
-    "corpus_sha": "aadb36f67dabf8be",
-    "chunk_count": 639,
+    "corpus_sha": "0681d5b98009bf68",
+    "chunk_count": 642,
     "evidence_floor": {
       "nomic-embed-text": 0.61,
       "default": 0.55
@@ -406,6 +406,11 @@
       "title": "Coloured console logger and startup banner (gem/utils/logger.py)",
       "kind": "code",
       "url": ""
+    },
+    "curated.results_format": {
+      "title": "GEM-pRF result files: format and naming (curated from gem source)",
+      "kind": "markdown",
+      "url": ""
     }
   },
   "parameters": [
@@ -615,7 +620,9 @@
       "significance": "During setup GEM uses this field to build CUDA_VISIBLE_DEVICES and then maps GEM's internal default device to index 0 of that filtered list.",
       "code_source_ids": [
         "code.init_setup",
-        "code.config_manager"
+        "code.config_manager",
+        "github.gem.utils.gem_gpu_manager",
+        "code.run_analysis"
       ]
     },
     {
@@ -1042,10 +1049,12 @@
         "output analysis id"
       ],
       "xml_path": "/root/input_datasrc/BIDS/results_anaylsis_id",
-      "summary": "Names the analysis-<id> directory where results are written in BIDS mode (the spelling 'anaylsis' is verbatim in the XML schema).",
+      "summary": "Names the analysis-<id> directory where results are written in BIDS mode (the spelling 'anaylsis' is verbatim in the XML schema). Result files are written inside it as *_estimates.json.",
       "significance": "OUTPUT counterpart of the Input Analysis ID: gem.init_setup resolves the results directory from this value.",
       "code_source_ids": [
-        "code.init_setup"
+        "code.init_setup",
+        "github.gem.tools.json_file_operations",
+        "github.gem.analysis.prf_r2_variance_explain"
       ]
     },
     {
@@ -1073,10 +1082,12 @@
         "basepath"
       ],
       "xml_path": "/root/input_datasrc/fixed_paths/results/basepath",
-      "summary": "Directory where results are written when the Input Data Source is Fixed Paths.",
+      "summary": "Directory where results are written when the Input Data Source is Fixed Paths. Result files are written into it as *_estimates.json.",
       "significance": "Fixed Paths counterpart of the Results Analysis ID: result files are written under exactly this directory.",
       "code_source_ids": [
-        "code.run_analysis"
+        "code.run_analysis",
+        "github.gem.tools.json_file_operations",
+        "github.gem.analysis.prf_r2_variance_explain"
       ]
     },
     {
@@ -1088,10 +1099,12 @@
         "custom result postfix"
       ],
       "xml_path": "/root/input_datasrc/fixed_paths/results/custom_filename_postfix",
-      "summary": "Custom postfix appended to result filenames in Fixed Paths mode (sample value '-sample').",
+      "summary": "Custom postfix appended to result filenames in Fixed Paths mode (sample value '-sample'). The final result filename is the input name with 'bold' replaced by 'estimates', plus this postfix and .json.",
       "significance": "Read by the run when composing result filenames under the Results Base Path.",
       "code_source_ids": [
-        "code.run_analysis"
+        "code.run_analysis",
+        "github.gem.tools.json_file_operations",
+        "github.gem.analysis.prf_r2_variance_explain"
       ]
     },
     {
@@ -1103,10 +1116,12 @@
         "prepend date to filename"
       ],
       "xml_path": "/root/input_datasrc/fixed_paths/results/prepend_date",
-      "summary": "Flag to prepend the date to result filenames in Fixed Paths mode.",
+      "summary": "Flag to prepend the date to result filenames in Fixed Paths mode. It applies to the *_estimates.json result filenames.",
       "significance": "Read by the run when composing result filenames under the Results Base Path.",
       "code_source_ids": [
-        "code.run_analysis"
+        "code.run_analysis",
+        "github.gem.tools.json_file_operations",
+        "github.gem.analysis.prf_r2_variance_explain"
       ]
     },
     {
@@ -4999,6 +5014,24 @@
       "source_id": "github.gem.utils.logger",
       "heading": "Coloured console logger and startup banner (gem/utils/logger.py)",
       "text": "def print_yellow_message(cls, message, print_file_name=True):             \n        print(f\"\\033[93m{message}\\033[0m\")\n        if print_file_name:\n            frame = inspect.currentframe().f_back\n            caller_filename = inspect.getframeinfo(frame).filename   \n            print(f\"\\033[93mFile: {caller_filename}\\033[0m\")\n\n# # base64.b64encode(original_str.encode('utf-8'))\nval = (b'PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CkdFTSBwUkYgQW5hbHlzaXMgU29mdHdhcmUKPT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09CgpAQXV0aG9yICAgOiBTaWRkaGFydGggTWl0dGFsCkBDb250YWN0ICA6IHNpZGRoYXJ0aC5taXR0YWxAbWVkdW5pd2llbi5hYy5hdApATGljZW5zZSAgOiAoQykgQ29weXJpZ2h0IDIwMjMtMjAyNSwgTWVkaWNhbCBVbml2ZXJzaXR5IG9mIFZpZW5uYSAKQENpdGUgRE9JIDogaHR0cHM6Ly9kb2kub3JnLzEwLjEwMTYvai5tZWRpYS4yMDI1LjEwMzg5MQoKUGFwZXIgVGl0bGU6IEdFTS1wUkY6IEdQVS1FbXBvd2VyZWQgTWFwcGluZyBvZiBQb3B1bGF0aW9uIApSZWNlcHRpdmUgRmllbGRzIGZvciBMYXJnZS1TY2FsZSBmTVJJIEFuYWx5c2lzCj09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQ==')\nLogger.print_yellow_message(base64.b64decode(val).decode('utf-8'), print_file_name=False)"
+    },
+    {
+      "id": "curated.results_format::0-635::74f64608c4",
+      "source_id": "curated.results_format",
+      "heading": "GEM-pRF result files",
+      "text": "GEM-pRF result file format. GEM-pRF writes pRF estimation results as JSON files whose names end in _estimates.json. gem.analysis.prf_r2_variance_explain.R2.format_in_json_format builds one JSON entry per fitted signal (per vertex for surface data, per voxel for flattened volumetric data) holding muX, muY, sigma, r2 and an optional refined signal timecourse, and gem.tools.json_file_operations.JsonMgr.write_to_file writes the list to the result filepath. The result file format is identical for surface-based and volumetric analyses and for BIDS and Fixed Paths input modes; only the number of entries and the output location differ."
+    },
+    {
+      "id": "curated.results_format::637-1100::0832a7d5d7",
+      "source_id": "curated.results_format",
+      "heading": "GEM-pRF result files",
+      "text": "GEM-pRF result file naming in BIDS mode. When BIDS input is enabled, gem.data.bids_handler.GemBidsHandler.inputpath2resultpath derives each result filepath from its input file: results are written under the analysis-<id> directory named by results_anaylsis_id, and the filename is the input filename ending in _estimates.json (concatenated runs are also written as *_estimates.json). The date prefix and custom filename postfix settings do not apply in BIDS mode."
+    },
+    {
+      "id": "curated.results_format::1102-1659::3df71fb3fd",
+      "source_id": "curated.results_format",
+      "heading": "GEM-pRF result files",
+      "text": "GEM-pRF result file naming in Fixed Paths mode. With fixed paths input, gem.run.run_gem_prf_analysis composes each result filepath under the results basepath: an optional date prefix when prepend_date is True, the measured-data filename with 'bold' replaced by 'estimates', the custom_filename_postfix, and the .json extension. HDF5 (.h5) files are not result files in GEM-pRF: .h5 appears only as debug output written by gem.utils.gem_write_to_file.GemWriteToFile when write_debug_info is enabled, and as the input file format for optional_analysis_params."
     }
   ]
 }
