@@ -1,7 +1,7 @@
 {
   "meta": {
-    "corpus_sha": "0681d5b98009bf68",
-    "chunk_count": 642,
+    "corpus_sha": "a420f72785f01cfc",
+    "chunk_count": 645,
     "evidence_floor": {
       "nomic-embed-text": 0.61,
       "default": 0.55
@@ -409,6 +409,11 @@
     },
     "curated.results_format": {
       "title": "GEM-pRF result files: format and naming (curated from gem source)",
+      "kind": "markdown",
+      "url": ""
+    },
+    "curated.runtime_behavior": {
+      "title": "GEM-pRF runtime behavior: version check, overwrite backup, debug output (curated from gem source)",
       "kind": "markdown",
       "url": ""
     }
@@ -1066,7 +1071,7 @@
         "overwrite existing results"
       ],
       "xml_path": "/root/input_datasrc/BIDS/results_anaylsis_id/@overwrite",
-      "summary": "Whether an existing results directory may be overwritten; backups with a timestamp are created when True.",
+      "summary": "Whether the run writes into an existing results directory; when False an existing directory is first moved aside to a timestamped backup.",
       "significance": "Attribute of results_anaylsis_id read by gem.init_setup when it prepares the output directory.",
       "code_source_ids": [
         "code.init_setup"
@@ -5032,6 +5037,24 @@
       "source_id": "curated.results_format",
       "heading": "GEM-pRF result files",
       "text": "GEM-pRF result file naming in Fixed Paths mode. With fixed paths input, gem.run.run_gem_prf_analysis composes each result filepath under the results basepath: an optional date prefix when prepend_date is True, the measured-data filename with 'bold' replaced by 'estimates', the custom_filename_postfix, and the .json extension. HDF5 (.h5) files are not result files in GEM-pRF: .h5 appears only as debug output written by gem.utils.gem_write_to_file.GemWriteToFile when write_debug_info is enabled, and as the input file format for optional_analysis_params."
+    },
+    {
+      "id": "curated.runtime_behavior::0-422::5dea6ae6cc",
+      "source_id": "curated.runtime_behavior",
+      "heading": "GEM-pRF runtime behavior",
+      "text": "GEM-pRF config version check. gem.init_setup compares the config file's @version attribute with the installed gemprf package __version__ and aborts on mismatch with 'Version mismatch: config=..., GEMpRF=...', pointing to https://gemprf.github.io/ to download matching versions. A config therefore only runs against the GEM-pRF release it was generated for; configs for older releases are kept in the site's config archive."
+    },
+    {
+      "id": "curated.runtime_behavior::424-1109::6bcd5b01a0",
+      "source_id": "curated.runtime_behavior",
+      "heading": "GEM-pRF runtime behavior",
+      "text": "GEM-pRF results overwrite and backup behavior. At setup gem.init_setup resolves the results directory (BIDS mode: <basepath>/derivatives/prfanalyze-gem/analysis-<results_anaylsis_id>; Fixed Paths mode: the results basepath). If that directory already exists and @overwrite is False, the existing directory is moved aside to <dir>_backup-YYYYMMDD-HHMMSS and a fresh one is created, so the old results survive as a timestamped backup; with @overwrite True the run writes into the existing directory in place. The config file itself is copied into the results directory. (The sample config's comment states this the other way around; the behavior above is what gem.init_setup implements.)"
+    },
+    {
+      "id": "curated.runtime_behavior::1111-1635::92f6f6120c",
+      "source_id": "curated.runtime_behavior",
+      "heading": "GEM-pRF runtime behavior",
+      "text": "GEM-pRF debug output (write_debug_info). When the search_space @write_debug_info attribute is true, gem.init_setup initialises the GemWriteToFile singleton with the results directory and the run writes debug_model_data.h5 there: the pRF grid ('model/prf_grid'), the HRF curve ('hrf'), the resampled and HRF-convolved stimulus per task, and per-batch model signals with their derivatives. When the flag is false nothing is written. This HDF5 file is diagnostic output only and separate from the *_estimates.json result files."
     }
   ]
 }
