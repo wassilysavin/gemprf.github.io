@@ -170,11 +170,16 @@
     "Then state every concrete value the evidence carries for this setting, INCLUDING one that appears only " +
     "in a sample or default configuration: name it and say what it is (a documented default, not a " +
     "recommendation) rather than calling the evidence silent. Say the evidence documents no value only when " +
-    "it shows none. Where the evidence gives a RULE instead of a number (e.g. 'x times the stimulus'), state " +
-    "the rule AS a rule and never supply operands of your own to illustrate it.\n" +
+    "it shows none. Where the evidence gives a RULE instead of a number (e.g. 'x times the stimulus') and the " +
+    "user has just supplied the quantity that rule runs on, apply the rule to their number and present the " +
+    "result as what the documented rule yields for their case -- that computed value is the answer they asked " +
+    "for, not an invention. Without their operand, state the rule AS a rule and never supply operands of your " +
+    "own to illustrate it.\n" +
     "Land it. When the evidence carries a documented value AND a direction to move it, put the two together " +
     "for them -- the documented value is where the documentation starts them, the documented direction is " +
-    "how it says to move from there -- attributing both to the documentation. When the evidence cannot " +
+    "how it says to move from there -- attributing both to the documentation. When their stated constraint " +
+    "removes one side of a documented trade (say, memory is no concern), draw that trade's conclusion for " +
+    "their side instead of restating both directions. When the evidence cannot " +
     "convert what they gave into a number, say that plainly in one sentence and then give them what it DOES " +
     "support, rather than closing on what is missing. Do NOT end with a question.";
 
@@ -236,7 +241,9 @@
     "determine the value.\n" +
     "- Otherwise the documentation gives only a DIRECTION (larger values cost less peak memory but more " +
     "iterations) and no way to compute a number: ask which way they want to trade -- " + GOAL_TRIAD +
-    ". A direction can serve a goal, but it cannot turn a hardware figure or a dataset size into " +
+    ". Word the trade exactly as the documentation states it; never offer an effect it does not document " +
+    "(GEM-pRF fits, it does not train -- 'stability', 'convergence', and 'training' name no documented trade). " +
+    "A direction can serve a goal, but it cannot turn a hardware figure or a dataset size into " +
     "a value, so do NOT ask for a number the documentation has no way to spend. A question whose answer " +
     "cannot change the reply is worse than no question.\n" +
     "You may use general knowledge to judge WHICH input the documentation needs, but you must NOT assert " +
@@ -1956,6 +1963,77 @@
     return out;
   }
 
+  // The names a code source answers to: its id's module segment plus the file basename in its title.
+  function sourceFileKeys(sid) {
+    var keys = [sid.split(".").pop().toLowerCase()];
+    var title = (knowledgeIndex.sources[sid] && knowledgeIndex.sources[sid].title) || "";
+    var m = /\(([^()]*\.py)\)/.exec(title);
+    if (m) keys.push(m[1].split("/").pop().replace(/\.py$/, "").toLowerCase());
+    if (title.indexOf(" ") === -1 && title.indexOf(".") !== -1) keys.push(title.split(".").pop().toLowerCase());
+    return keys;
+  }
+
+  // File-named code requests route to the named source; the parameter path would show some OTHER file's code.
+  function findSourceCodeChunks(question) {
+    var q = String(question || "").toLowerCase();
+    var definite = [], loose = [];
+    (q.match(/[\w./-]+\.py\b/g) || []).forEach(function (t) {
+      var base = t.split("/").pop().replace(/\.py$/, "");
+      if (base && definite.indexOf(base) === -1) definite.push(base);
+    });
+    (q.match(/\b[a-z][a-z0-9]*(?:[._][a-z0-9]+)+\b/g) || []).forEach(function (t) {
+      if (/\.py$/.test(t)) return;
+      var base = t.split(".").pop();
+      if (definite.indexOf(base) === -1 && loose.indexOf(base) === -1) loose.push(base);
+    });
+    var codeSids = Object.keys(knowledgeIndex.sources).filter(function (sid) {
+      return knowledgeIndex.sources[sid].kind === "code" && !/tests?[._/]|_test|test_/i.test(sid);
+    });
+    var matches = function (base) { return codeSids.filter(function (sid) { return sourceFileKeys(sid).indexOf(base) !== -1; }); };
+    var hit = [];
+    definite.concat(loose).forEach(function (b) {
+      matches(b).forEach(function (sid) { if (hit.indexOf(sid) === -1) hit.push(sid); });
+    });
+    // Substantial implementation chunks lead: 'the code' means the routines, not the header or a split sliver.
+    var chunks = [];
+    hit.forEach(function (sid) {
+      var mine = knowledgeIndex.chunks.filter(function (c) { return c.source_id === sid; });
+      var rank = function (c) { return /(^|\n)\s*(def|class)\s/.test(c.text) ? (c.text.length >= 500 ? 0 : 1) : 2; };
+      chunks = chunks.concat(mine.slice().sort(function (a, b) { return rank(a) - rank(b); }));
+    });
+    // A missed bare token is just a word; a missed .py name is a file the user must hear we do not have.
+    return { chunks: chunks, missed: hit.length ? [] : definite.map(function (b) { return b + ".py"; }) };
+  }
+
+  // Honest miss for a file request: naming what IS indexed beats silently showing another file's code.
+  function sayFileNotIndexed(question, missed) {
+    var examples = [], seen = Object.create(null);
+    Object.keys(knowledgeIndex.sources).forEach(function (sid) {
+      if (knowledgeIndex.sources[sid].kind !== "code" || /tests?[._/]|_test|test_/i.test(sid)) return;
+      var base = sid.split(".").pop();
+      if (!seen[base] && examples.length < 4) { seen[base] = 1; examples.push(base); }
+    });
+    var msg = "I don't have " + missed.join(", ") + " in my indexed GEM-pRF code sources, so I can't show it. " +
+      "Indexed code includes " + examples.join(", ") + " -- or ask about a setting and I'll show where it's used.";
+    activeBot.classList.remove("gpa-cursor");
+    activeBot.innerHTML = renderMarkdown(msg);
+    recordTurn(question, msg);
+    scrollDown();
+    return Promise.resolve();
+  }
+
+  // Honest terminus for a file request whose every indexed chunk has been shown.
+  function sayFileExhausted(question, sids) {
+    var names = sids.map(function (sid) { return (knowledgeIndex.sources[sid] && knowledgeIndex.sources[sid].title) || sid; });
+    var msg = "That's every indexed chunk of " + names.join(" and ") + " -- I've shown them all. " +
+      "Ask about a setting and I'll show where it's used.";
+    activeBot.classList.remove("gpa-cursor");
+    activeBot.innerHTML = renderMarkdown(msg);
+    recordTurn(question, msg);
+    scrollDown();
+    return Promise.resolve();
+  }
+
   // Honest terminus for a wants-more code request: re-showing the same excerpts would pass them off as new.
   function sayCodeExhausted(question, retrieval, standalone) {
     var specs = codeParamsForQuestion(standalone || question);
@@ -1972,10 +2050,11 @@
   }
 
   // Show code verbatim: the model rewrites real code (wrong signatures, dropped lines) when asked to quote it.
-  function showCodeVerbatim(question, retrieval, codeChunks) {
+  function showCodeVerbatim(question, retrieval, codeChunks, isFileRoute) {
     codeChunks.forEach(function (c) { shownCodeChunks[chunkKey(c)] = 1; });
-    var namedSpecs = codeParamsForQuestion(question);
-    if (!namedSpecs.length && retrieval.specs && retrieval.specs[0]) namedSpecs = [retrieval.specs[0]];
+    // A file request carries no parameter: the spec fallback would caption it with another setting's sites.
+    var namedSpecs = isFileRoute ? [] : codeParamsForQuestion(question);
+    if (!isFileRoute && !namedSpecs.length && retrieval.specs && retrieval.specs[0]) namedSpecs = [retrieval.specs[0]];
     var terms = namedSpecs.length ? tokenize(namedSpecs.map(function (s) { return [s.label].concat(s.aliases || []).join(" "); }).join(" ")) : tokenize(question);
     var blocks = codeChunks.map(function (c, i) {
       // Strips the indexer's breadcrumb line; the same pattern can bite a code line containing ' > '.
@@ -2019,6 +2098,20 @@
     }
     // Detect and locate code from the condensed question, but explain using the user's literal wording.
     if (isCodeRequest(standalone || question)) {
+      var byFile = findSourceCodeChunks(standalone || question);
+      if (byFile.missed.length) return sayFileNotIndexed(question, byFile.missed);
+      if (byFile.chunks.length) {
+        var unseenFile = byFile.chunks.filter(function (c) { return !shownCodeChunks[chunkKey(c)]; });
+        if (!unseenFile.length) {
+          var fileSids = [];
+          byFile.chunks.forEach(function (c) { if (fileSids.indexOf(c.source_id) === -1) fileSids.push(c.source_id); });
+          return sayFileExhausted(question, fileSids);
+        }
+        // One block per named file; repeat requests walk the tail instead of dumping the whole source.
+        var perSource = [], taken = Object.create(null);
+        unseenFile.forEach(function (c) { if (!taken[c.source_id]) { taken[c.source_id] = 1; perSource.push(c); } });
+        return showCodeVerbatim(question, retrieval, perSource.slice(0, 3), true);
+      }
       var codeChunks = findCodeChunks(standalone || question, retrieval);
       if (codeChunks.length) {
         var unseen = codeChunks.filter(function (c) { return !shownCodeChunks[chunkKey(c)]; });
@@ -2414,6 +2507,7 @@
       resolveForkReply: resolveForkReply, foldClarifyReply: foldClarifyReply, forkReaskQuestion: forkReaskQuestion,
       isCodeRequest: isCodeRequest, codeParamForQuestion: codeParamForQuestion, codeParamsForQuestion: codeParamsForQuestion, findCodeChunk: findCodeChunk, findCodeChunks: findCodeChunks,
       codeUsageSites: codeUsageSites, codeMentionLine: codeMentionLine, findFollowupCodeChunks: findFollowupCodeChunks,
+      findSourceCodeChunks: findSourceCodeChunks, sourceFileKeys: sourceFileKeys,
       _markCodeShown: function (c) { shownCodeChunks[chunkKey(c)] = 1; },
       _clearCodeShown: function () { shownCodeChunks = Object.create(null); },
       namesParameter: namesParameter, spellNormalize: spellNormalize, valueClarifyingQuestion: valueClarifyFallback,
