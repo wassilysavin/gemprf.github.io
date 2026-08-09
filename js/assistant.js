@@ -123,7 +123,12 @@
     "describe it in plain English when the user wants the concept.\n\n" +
     "Do not invent numbers, citations, authors, container names, version IDs, " +
     "affiliations, rationales, mechanisms, or explanations that are not present in the " +
-    "evidence, and never offer a value as one the field commonly uses.\n\n" +
+    "evidence, and never offer a value as one the field commonly uses.\n" +
+    "  When a matched parameter line carries 'Documented values in the indexed configs', treat that " +
+    "list as exhaustive: present ONLY those numbers as values this setting takes in configs. Config " +
+    "text packs many settings into one line, so attribute any other number to the field that carries " +
+    "it, never to this setting. This gates config-value claims only: a value computed by applying a " +
+    "documented rule to the user's stated input is the rule's result, not a config value.\n\n" +
     "A CONVERSATION HISTORY block may precede the question. Use it ONLY to resolve what " +
     "the question refers to (e.g. 'it', 'that parameter', a short follow-up). Prior " +
     "answers are NOT evidence: every factual claim must still be grounded in the " +
@@ -1301,11 +1306,51 @@
     });
   }
 
+  // Corpus-derived value enumeration per parameter, scoped to the xml_path's own field, so the model never mines config text for numbers.
+  var _docValuesCache = Object.create(null);
+  function documentedValues(spec) {
+    if (_docValuesCache[spec.id]) return _docValuesCache[spec.id];
+    var segs = String(spec.xml_path || "").split("/").filter(Boolean);
+    var last = segs[segs.length - 1] || "";
+    var out = [];
+    if (last && last.indexOf("*") === -1) {
+      var isAttr = last.charAt(0) === "@";
+      var name = isAttr ? last.slice(1) : last;
+      var parent = isAttr ? (segs[segs.length - 2] || "") : "";
+      var re = isAttr
+        ? new RegExp("<" + parent + "\\b[^>]*?[\\s\"']" + name + "=\"([^\"]*)\"", "g")
+        : new RegExp("<" + name + ">\\s*([^<]*?)\\s*</" + name + ">", "g");
+      var counts = Object.create(null), order = [];
+      knowledgeIndex.chunks.forEach(function (c) {
+        if (evidenceClass(c.source_id) !== "sample") return;
+        var m; re.lastIndex = 0;
+        while ((m = re.exec(c.text)) !== null) {
+          var v = m[1].trim();
+          if (!v) continue;
+          if (!counts[v]) { counts[v] = Object.create(null); order.push(v); }
+          counts[v][c.source_id] = 1;
+        }
+      });
+      out = order.map(function (v) { return { value: v, configs: Object.keys(counts[v]).length }; });
+    }
+    return (_docValuesCache[spec.id] = out);
+  }
+
+  function documentedValuesLine(spec) {
+    var vals = documentedValues(spec);
+    if (!vals.length) return "";
+    return " Documented values in the indexed configs: " + vals.map(function (v) {
+      return v.value + " (" + v.configs + (v.configs === 1 ? " config)" : " configs)");
+    }).join(", ") + ".";
+  }
+
   function parameterContext(question, specs) {
     var line = function (p) { return "- " + p.label + " (" + p.xml_path + "): " + p.summary + " " + p.significance; };
     var named = [], related = [];
     specs.forEach(function (p) { (specNamedIn(question, p) ? named : related).push(p); });
-    var out = named.length ? named.map(line).join("\n") : "- none";
+    // Only a named spec gets the enumeration: the related list must stay too thin to anchor an answer on.
+    var namedLine = function (p) { return line(p) + documentedValuesLine(p); };
+    var out = named.length ? named.map(namedLine).join("\n") : "- none";
     if (related.length) {
       out += "\n\nPossibly related settings (matched by wording similarity only; the question does not " +
         "name them -- do not anchor the answer on them):\n" + related.map(line).join("\n");
@@ -2508,6 +2553,7 @@
       isCodeRequest: isCodeRequest, codeParamForQuestion: codeParamForQuestion, codeParamsForQuestion: codeParamsForQuestion, findCodeChunk: findCodeChunk, findCodeChunks: findCodeChunks,
       codeUsageSites: codeUsageSites, codeMentionLine: codeMentionLine, findFollowupCodeChunks: findFollowupCodeChunks,
       findSourceCodeChunks: findSourceCodeChunks, sourceFileKeys: sourceFileKeys,
+      documentedValues: documentedValues, parameterContext: parameterContext,
       _markCodeShown: function (c) { shownCodeChunks[chunkKey(c)] = 1; },
       _clearCodeShown: function () { shownCodeChunks = Object.create(null); },
       namesParameter: namesParameter, spellNormalize: spellNormalize, valueClarifyingQuestion: valueClarifyFallback,
@@ -2524,7 +2570,7 @@
       _setHistory: function (h) { history = h; },
       pickEmbedModel: pickEmbedModel, buildChunkVectors: buildChunkVectors, ollamaEmbed: ollamaEmbed,
       // A test swapping the index must clear these four caches.
-      _load: function (j) { knowledgeIndex = j; bm25 = prepareBm25(knowledgeIndex.chunks); _tokenOwnersCache = null; _anchorVocabCache = null; _headOwnersCache = null; _queryVocabCache = null; _usageSitesCache = Object.create(null); },
+      _load: function (j) { knowledgeIndex = j; bm25 = prepareBm25(knowledgeIndex.chunks); _tokenOwnersCache = null; _anchorVocabCache = null; _headOwnersCache = null; _queryVocabCache = null; _usageSitesCache = Object.create(null); _docValuesCache = Object.create(null); },
       _setModel: function (m) { chatModel = m; },
       _setEmbedModel: function (m) { embedModel = m; },
       _setModelDigests: function (d) { modelDigests = d; },
