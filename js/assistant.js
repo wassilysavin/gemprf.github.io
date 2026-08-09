@@ -1903,6 +1903,59 @@
     return arr.length ? arr[0] : null;
   }
 
+  // Chunk ids embed 'source::start-end::hash'; the range places a key hit in absolute coordinates.
+  function chunkRange(c) {
+    var m = /::(\d+)-(\d+)::/.exec(c.id || "");
+    return m ? [parseInt(m[1], 10), parseInt(m[2], 10)] : null;
+  }
+
+  // True when the chunk holds a quoted-key hit outside every shown range: overlap re-serves don't count.
+  function hasFreshKeySite(c, distinctive, shownRanges) {
+    var range = chunkRange(c), low = String(c.text || "").toLowerCase();
+    for (var k = 0; k < distinctive.length; k++) {
+      var needles = ['"' + distinctive[k] + '"', "'" + distinctive[k] + "'"];
+      for (var n = 0; n < needles.length; n++) {
+        var i = 0;
+        while ((i = low.indexOf(needles[n], i)) !== -1) {
+          var abs = range ? range[0] + i : null;
+          var covered = abs !== null && shownRanges.some(function (r) { return abs >= r[0] && abs < r[1]; });
+          if (!covered) return true;
+          i += needles[n].length;
+        }
+      }
+    }
+    return false;
+  }
+
+  // A wants-more turn digs past the per-source best pick: later quoted-key sites in already-shown files.
+  function findFollowupCodeChunks(question, retrieval) {
+    var named = codeParamsForQuestion(question);
+    if (!named.length && retrieval.specs && retrieval.specs[0]) named = [retrieval.specs[0]];
+    var isCode = function (c) {
+      var s = knowledgeIndex.sources[c.source_id];
+      return s && s.kind === "code" && !/tests?[._/]|_test|test_/i.test(c.source_id);
+    };
+    var out = [], seen = Object.create(null);
+    named.forEach(function (spec) {
+      var terms = specTerms(spec);
+      var distinctive = terms.filter(function (w) { return w.length >= 3 && !GENERIC_CODE[w]; });
+      if (!distinctive.length) return;
+      var sids = (spec.code_source_ids || []).slice();
+      codeUsageSites(spec).strong.forEach(function (sid) { if (sids.indexOf(sid) === -1) sids.push(sid); });
+      sids.forEach(function (sid) {
+        var chunks = knowledgeIndex.chunks.filter(function (c) { return c.source_id === sid && isCode(c); });
+        var shownRanges = chunks.filter(function (c) { return shownCodeChunks[chunkKey(c)]; }).map(chunkRange).filter(Boolean);
+        chunks.forEach(function (c) {
+          if (shownCodeChunks[chunkKey(c)] || seen[chunkKey(c)]) return;
+          if (!hasFreshKeySite(c, distinctive, shownRanges)) return;
+          seen[chunkKey(c)] = 1;
+          out.push(c);
+        });
+      });
+    });
+    return out;
+  }
+
   // Honest terminus for a wants-more code request: re-showing the same excerpts would pass them off as new.
   function sayCodeExhausted(question, retrieval, standalone) {
     var specs = codeParamsForQuestion(standalone || question);
@@ -1975,7 +2028,9 @@
         // Repeat-bound: whether they want MORE or a re-show is a speech act, so a classifier reads it.
         return asksForMoreCode(question).then(function (more) {
           if (!more) return showCodeVerbatim(question, retrieval, codeChunks.slice(0, 5));
-          return unseen.length ? showCodeVerbatim(question, retrieval, unseen.slice(0, 5)) : sayCodeExhausted(question, retrieval, standalone);
+          if (unseen.length) return showCodeVerbatim(question, retrieval, unseen.slice(0, 5));
+          var followup = findFollowupCodeChunks(standalone || question, retrieval);
+          return followup.length ? showCodeVerbatim(question, retrieval, followup.slice(0, 5)) : sayCodeExhausted(question, retrieval, standalone);
         });
       }
     }
@@ -2358,7 +2413,9 @@
       termFork: forkCandidates, forkQuestion: forkQuestion, forkIsTheSubject: forkIsTheSubject, CLARIFY_DIRECTIVE: CLARIFY_DIRECTIVE,
       resolveForkReply: resolveForkReply, foldClarifyReply: foldClarifyReply, forkReaskQuestion: forkReaskQuestion,
       isCodeRequest: isCodeRequest, codeParamForQuestion: codeParamForQuestion, codeParamsForQuestion: codeParamsForQuestion, findCodeChunk: findCodeChunk, findCodeChunks: findCodeChunks,
-      codeUsageSites: codeUsageSites, codeMentionLine: codeMentionLine,
+      codeUsageSites: codeUsageSites, codeMentionLine: codeMentionLine, findFollowupCodeChunks: findFollowupCodeChunks,
+      _markCodeShown: function (c) { shownCodeChunks[chunkKey(c)] = 1; },
+      _clearCodeShown: function () { shownCodeChunks = Object.create(null); },
       namesParameter: namesParameter, spellNormalize: spellNormalize, valueClarifyingQuestion: valueClarifyFallback,
       generateValueClarify: generateValueClarify,
       needsGoal: needsGoal, engageWithoutEvidence: engageWithoutEvidence, asksForMoreCode: asksForMoreCode,
