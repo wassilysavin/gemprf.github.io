@@ -646,7 +646,9 @@
         "under_disp",
         "peak_to_undershoot",
         "normalize",
-        "tr"
+        "tr",
+        "time range",
+        "hrf time range"
       ],
       "xml_path": "/root/search_space/default_hrf/@*",
       "summary": "SPM-style HRF parameter block used when no HRF is loaded from file.",
@@ -768,6 +770,397 @@
       "code_source_ids": [
         "code.config_manager",
         "code.orthogonalization",
+        "code.run_analysis"
+      ]
+    },
+    {
+      "id": "config.version",
+      "label": "Config Version",
+      "aliases": [
+        "config version",
+        "configuration version",
+        "config file version"
+      ],
+      "xml_path": "/root/@version",
+      "summary": "The config schema version stamped on the XML root; the generator currently produces version 0.1.12 configs only.",
+      "significance": "gem.init_setup pins the config version GEM-pRF supports; configs for older versions are kept in the site's config archive list.",
+      "code_source_ids": [
+        "code.init_setup"
+      ]
+    },
+    {
+      "id": "config_filename.data_source",
+      "label": "Config Filename Data Source",
+      "aliases": [
+        "data source",
+        "filename data source",
+        "config filename data source"
+      ],
+      "xml_path": "",
+      "summary": "A short identifier for your data source (max 5 words, e.g. HCP or NYU) entered in the configurator's Config Filename Builder.",
+      "significance": "Cosmetic only: it shapes the generated config's suggested filename and has no corresponding element in the config XML.",
+      "code_source_ids": []
+    },
+    {
+      "id": "config_filename.stimulus_type",
+      "label": "Config Filename Stimulus Type",
+      "aliases": [
+        "stimulus type",
+        "filename stimulus type",
+        "config filename stimulus type"
+      ],
+      "xml_path": "",
+      "summary": "The type of stimulus used (max 5 words, e.g. fixed bar) entered in the configurator's Config Filename Builder.",
+      "significance": "Cosmetic only: it shapes the generated config's suggested filename and has no corresponding element in the config XML.",
+      "code_source_ids": []
+    },
+    {
+      "id": "config_filename.description",
+      "label": "Config Filename Description",
+      "aliases": [
+        "filename description",
+        "config filename description"
+      ],
+      "xml_path": "",
+      "summary": "A brief free-text description (max 10 words) entered in the configurator's Config Filename Builder.",
+      "significance": "Cosmetic only: it shapes the generated config's suggested filename and has no corresponding element in the config XML.",
+      "code_source_ids": []
+    },
+    {
+      "id": "stimulus.directory",
+      "label": "Stimulus Directory",
+      "aliases": [
+        "stimulus directory",
+        "stimulus dir",
+        "stimuli directory"
+      ],
+      "xml_path": "/root/stimulus/directory",
+      "summary": "Path to the directory holding the stimulus aperture files, which must be in NIfTI format (sample value Path/to/data/BIDS/stimuli).",
+      "significance": "The stimulus pipeline reads aperture files from this directory when input is BIDS-organised; Fixed Paths mode names the stimulus file directly instead.",
+      "code_source_ids": [
+        "code.prf_stimulus",
+        "code.run_analysis"
+      ]
+    },
+    {
+      "id": "stimulus.binarization.enable",
+      "label": "Enable Binarization",
+      "aliases": [
+        "enable binarization",
+        "binarization enable"
+      ],
+      "xml_path": "/root/stimulus/binarization/@enable",
+      "summary": "Master switch for stimulus binarization: when enabled, aperture values above the threshold become 1 and the rest 0.",
+      "significance": "The stimulus pipeline applies thresholding only when this attribute is True; disabled, the stimulus keeps its original intensity values.",
+      "code_source_ids": [
+        "code.prf_stimulus"
+      ]
+    },
+    {
+      "id": "stimulus.high_temporal_resolution.enable",
+      "label": "Enable High Temporal Resolution",
+      "aliases": [
+        "high temporal resolution",
+        "enable high temporal resolution",
+        "high_temporal_resolution"
+      ],
+      "xml_path": "/root/stimulus/high_temporal_resolution/@enable",
+      "summary": "Enables computing model signals with the high-resolution stimulus and then downsampling them to the fMRI timecourse length.",
+      "significance": "When enabled, signals are generated at stimulus rate and downsampled to num_frames_downsampled using slice_time_ref as the slice-timing reference.",
+      "code_source_ids": [
+        "code.prf_stimulus"
+      ]
+    },
+    {
+      "id": "input.data_source",
+      "label": "Input Data Source",
+      "aliases": [
+        "data source",
+        "input data source",
+        "datasrc",
+        "input_datasrc",
+        "data organization type"
+      ],
+      "xml_path": "/root/input_datasrc",
+      "summary": "Selects where GEM-pRF reads input data from: a BIDS-organised tree (BIDS section, @enable=True) or explicit file paths (fixed_paths).",
+      "significance": "The BIDS @enable attribute is the master switch; when False the fixed_paths section supplies the stimulus and measured-data files directly.",
+      "code_source_ids": [
+        "code.bids_handler",
+        "code.config_manager"
+      ]
+    },
+    {
+      "id": "input.BIDS.basepath",
+      "label": "BIDS Base Path",
+      "aliases": [
+        "basepath",
+        "base path",
+        "bids base path",
+        "bids basepath"
+      ],
+      "xml_path": "/root/input_datasrc/BIDS/basepath",
+      "summary": "Root directory of the BIDS-organised dataset that GEM-pRF scans for input files (sample value Path/to/data/BIDS).",
+      "significance": "The BIDS handler joins this with the append_to_basepath segments to locate the derivatives tree it searches.",
+      "code_source_ids": [
+        "code.bids_handler"
+      ]
+    },
+    {
+      "id": "input.BIDS.append_to_basepath",
+      "label": "Append to Base Path",
+      "aliases": [
+        "append_to_basepath",
+        "append to basepath",
+        "append to base path"
+      ],
+      "xml_path": "/root/input_datasrc/BIDS/append_to_basepath",
+      "summary": "Comma-separated path segments appended to the BIDS base path (sample value: derivatives, fmriprep).",
+      "significance": "Parsed as a comma-separated list with whitespace stripped by the BIDS handler when building the derivatives root it scans.",
+      "code_source_ids": [
+        "code.bids_handler"
+      ]
+    },
+    {
+      "id": "input.BIDS.analysis",
+      "label": "Input Analysis ID",
+      "aliases": [
+        "analysis id",
+        "input analysis id",
+        "bids analysis",
+        "analysis selector"
+      ],
+      "xml_path": "/root/input_datasrc/BIDS/analysis",
+      "summary": "INPUT selector choosing which analysis-<id> derivative directories under the base path are read; comma-separated values or 'all'.",
+      "significance": "Case sensitive like all BIDS selectors; distinct from the Results Analysis ID, which names the OUTPUT directory.",
+      "code_source_ids": [
+        "code.bids_handler"
+      ]
+    },
+    {
+      "id": "input.BIDS.sub",
+      "label": "BIDS Subjects",
+      "aliases": [
+        "subjects",
+        "bids subjects",
+        "subject selection"
+      ],
+      "xml_path": "/root/input_datasrc/BIDS/sub",
+      "summary": "Chooses which subjects are analysed; comma-separated values or 'all' (sample value 'all').",
+      "significance": "Case sensitive: values must match the dataset's sub-<label> directories exactly.",
+      "code_source_ids": [
+        "code.bids_handler"
+      ]
+    },
+    {
+      "id": "input.BIDS.hemi",
+      "label": "BIDS Hemisphere",
+      "aliases": [
+        "hemisphere",
+        "hemi",
+        "bids hemisphere",
+        "hemisphere selection"
+      ],
+      "xml_path": "/root/input_datasrc/BIDS/hemi",
+      "summary": "Chooses which hemisphere(s) of surface data are analysed; comma-separated values or 'all' (sample value 'all').",
+      "significance": "Case sensitive like the other BIDS selectors; applies to surface inputs, where files are per-hemisphere.",
+      "code_source_ids": [
+        "code.bids_handler"
+      ]
+    },
+    {
+      "id": "input.BIDS.individual",
+      "label": "Individual Task Analysis",
+      "aliases": [
+        "individual task analysis",
+        "individual task",
+        "task selector",
+        "session selector",
+        "run selector"
+      ],
+      "xml_path": "/root/input_datasrc/BIDS/individual",
+      "summary": "Selectors used when BIDS Run Type is individual: exactly one task, plus ses and run as comma-separated values or 'all'.",
+      "significance": "The task field allows a single value with no spaces or commas; the BIDS handler collects each matching file as its own analysis input.",
+      "code_source_ids": [
+        "code.bids_handler"
+      ]
+    },
+    {
+      "id": "input.BIDS.concatenated",
+      "label": "Concatenated Analysis",
+      "aliases": [
+        "concatenated analysis",
+        "concatenate items",
+        "concatenate_item",
+        "concatenation"
+      ],
+      "xml_path": "/root/input_datasrc/BIDS/concatenated",
+      "summary": "One or more concatenate_item blocks, each naming exactly one ses, task and run, whose signals are concatenated into a single analysis.",
+      "significance": "Read only when BIDS Run Type is concatenated; the handler iterates the blocks to build the grouped input.",
+      "code_source_ids": [
+        "code.bids_handler"
+      ]
+    },
+    {
+      "id": "input.fixed_paths.stimulus_filepath",
+      "label": "Fixed Paths Stimulus File Path",
+      "aliases": [
+        "stimulus_filepath",
+        "stimulus file path",
+        "fixed stimulus path"
+      ],
+      "xml_path": "/root/input_datasrc/fixed_paths/stimulus_filepath",
+      "summary": "Direct path to the stimulus apertures file (.nii.gz) used when the Input Data Source is Fixed Paths.",
+      "significance": "Fixed Paths counterpart of the Stimulus Directory: the file is named explicitly instead of resolved from a BIDS tree.",
+      "code_source_ids": [
+        "code.bids_handler"
+      ]
+    },
+    {
+      "id": "input.fixed_paths.measured_data_filepath",
+      "label": "Measured Data File Paths",
+      "aliases": [
+        "measured_data_filepath",
+        "measured data file paths",
+        "measured data paths",
+        "data file paths"
+      ],
+      "xml_path": "/root/input_datasrc/fixed_paths/measured_data_filepath",
+      "summary": "One or more filepath blocks pointing directly at measured-data files when the Input Data Source is Fixed Paths.",
+      "significance": "Each entry is a separate filepath element; the run loads exactly these files instead of scanning a BIDS tree.",
+      "code_source_ids": [
+        "code.run_analysis"
+      ]
+    },
+    {
+      "id": "results.BIDS.analysis_id",
+      "label": "Results Analysis ID",
+      "aliases": [
+        "analysis id",
+        "results analysis id",
+        "results analysis",
+        "results_anaylsis_id",
+        "output analysis id"
+      ],
+      "xml_path": "/root/input_datasrc/BIDS/results_anaylsis_id",
+      "summary": "Names the analysis-<id> directory where results are written in BIDS mode (the spelling 'anaylsis' is verbatim in the XML schema).",
+      "significance": "OUTPUT counterpart of the Input Analysis ID: gem.init_setup resolves the results directory from this value.",
+      "code_source_ids": [
+        "code.init_setup"
+      ]
+    },
+    {
+      "id": "results.BIDS.overwrite",
+      "label": "Overwrite Existing Results",
+      "aliases": [
+        "overwrite",
+        "results overwrite",
+        "overwrite existing results"
+      ],
+      "xml_path": "/root/input_datasrc/BIDS/results_anaylsis_id/@overwrite",
+      "summary": "Whether an existing results directory may be overwritten; backups with a timestamp are created when True.",
+      "significance": "Attribute of results_anaylsis_id read by gem.init_setup when it prepares the output directory.",
+      "code_source_ids": [
+        "code.init_setup"
+      ]
+    },
+    {
+      "id": "results.fixed.basepath",
+      "label": "Results Base Path",
+      "aliases": [
+        "results base path",
+        "results basepath",
+        "base path",
+        "basepath"
+      ],
+      "xml_path": "/root/input_datasrc/fixed_paths/results/basepath",
+      "summary": "Directory where results are written when the Input Data Source is Fixed Paths.",
+      "significance": "Fixed Paths counterpart of the Results Analysis ID: result files are written under exactly this directory.",
+      "code_source_ids": [
+        "code.run_analysis"
+      ]
+    },
+    {
+      "id": "results.fixed.custom_filename_postfix",
+      "label": "Custom Filename Postfix",
+      "aliases": [
+        "custom_filename_postfix",
+        "filename postfix",
+        "custom result postfix"
+      ],
+      "xml_path": "/root/input_datasrc/fixed_paths/results/custom_filename_postfix",
+      "summary": "Custom postfix appended to result filenames in Fixed Paths mode (sample value '-sample').",
+      "significance": "Read by the run when composing result filenames under the Results Base Path.",
+      "code_source_ids": [
+        "code.run_analysis"
+      ]
+    },
+    {
+      "id": "results.fixed.prepend_date",
+      "label": "Prepend Date",
+      "aliases": [
+        "prepend_date",
+        "prepend date",
+        "prepend date to filename"
+      ],
+      "xml_path": "/root/input_datasrc/fixed_paths/results/prepend_date",
+      "summary": "Flag to prepend the date to result filenames in Fixed Paths mode.",
+      "significance": "Read by the run when composing result filenames under the Results Base Path.",
+      "code_source_ids": [
+        "code.run_analysis"
+      ]
+    },
+    {
+      "id": "prf_model.model",
+      "label": "pRF Model Type",
+      "aliases": [
+        "model type",
+        "prf model",
+        "model",
+        "2d_gaussian",
+        "gaussian model"
+      ],
+      "xml_path": "/root/pRF_model/model",
+      "summary": "Selects the pRF model to fit; currently only 2d_gaussian is available (DoG and CSS are listed but not available).",
+      "significance": "The analysis instantiates the selected model class; the configurator disables the DoG and CSS options accordingly.",
+      "code_source_ids": [
+        "code.run_analysis",
+        "github.gem.model.selected_prf_model"
+      ]
+    },
+    {
+      "id": "search_space.write_debug_info",
+      "label": "Write Debug Info",
+      "aliases": [
+        "write_debug_info",
+        "write debug info",
+        "debug info"
+      ],
+      "xml_path": "/root/search_space/@write_debug_info",
+      "summary": "When true, the analysis writes additional debug information during fitting.",
+      "significance": "Attribute on the search_space element read by the config manager and setup code.",
+      "code_source_ids": [
+        "code.config_manager",
+        "code.init_setup"
+      ]
+    },
+    {
+      "id": "search_space.optional_analysis_params",
+      "label": "Optional Analysis Parameters",
+      "aliases": [
+        "optional_analysis_params",
+        "optional analysis parameters",
+        "custom parameters from file",
+        "analysis_additional_params",
+        "hrf key",
+        "sigmas key",
+        "spatial grid key",
+        "use_from_file"
+      ],
+      "xml_path": "/root/search_space/optional_analysis_params",
+      "summary": "Optional block loading custom HRF values, sigmas and/or spatial grid from an HDF5 file instead of the defaults: an @enable flag, a filepath, and per-item use_from_file flags with H5 keys.",
+      "significance": "When @enable is False the default_hrf, default_spatial_grid and default_sigmas blocks apply; the keys default to analysis_params/hrf_values, analysis_params/sigmas and analysis_params/spatial_grid_xy.",
+      "code_source_ids": [
+        "code.config_manager",
         "code.run_analysis"
       ]
     }
